@@ -256,11 +256,16 @@ func scanTargets(ctx context.Context, targets []string, opts tlsscan.Options, wa
 	sem := make(chan struct{}, batchConcurrency)
 	var wg sync.WaitGroup
 	for i, target := range targets {
-		// Stop dispatching promptly on cancellation (Ctrl-C/SIGTERM); rows not
-		// yet scanned stay zero-valued and render as having no problem.
+		// Stop dispatching promptly on cancellation (Ctrl-C/SIGTERM). Targets
+		// not yet dispatched are marked failed with the cancellation error: a
+		// zero-valued row (no report, no error) would violate BatchRow's
+		// invariant and panic the batch rendering and exit-code paths.
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
+			for j := i; j < len(targets); j++ {
+				rows[j] = report.BatchRow{Host: targets[j], Err: ctx.Err().Error()}
+			}
 			wg.Wait()
 			return rows
 		}
@@ -340,7 +345,7 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	return targets, nil
 }
 
-// readHostFile opens path and parses its target lines. It wraps the open error
+// readHostFile opens path and parses its target lines. It wraps the errors
 // so the caller reports a clear message; parsing itself is delegated to
 // parseHostList so it can be tested without disk.
 func readHostFile(path string) ([]string, error) {
@@ -349,13 +354,19 @@ func readHostFile(path string) ([]string, error) {
 		return nil, fmt.Errorf("read host file: %w", err)
 	}
 	defer f.Close()
-	return parseHostList(f), nil
+	targets, err := parseHostList(f)
+	if err != nil {
+		return nil, fmt.Errorf("read host file %s: %w", path, err)
+	}
+	return targets, nil
 }
 
 // parseHostList reads one target per line from r, trimming surrounding
 // whitespace and skipping blank lines and lines whose first non-blank character
-// is '#'. It takes an io.Reader so tests can supply an in-memory source.
-func parseHostList(r io.Reader) []string {
+// is '#'. It takes an io.Reader so tests can supply an in-memory source. A
+// read failure is returned as an error rather than silently truncating the
+// list, which would make a monitoring run quietly watch fewer hosts.
+func parseHostList(r io.Reader) ([]string, error) {
 	var targets []string
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
@@ -365,7 +376,10 @@ func parseHostList(r io.Reader) []string {
 		}
 		targets = append(targets, line)
 	}
-	return targets
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return targets, nil
 }
 
 // runSweep handles the "sweep" subcommand: probe many ports of a single host

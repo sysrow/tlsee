@@ -9,6 +9,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -475,45 +477,80 @@ func TestStartTLSNegotiatePostgresUnsupported(t *testing.T) {
 	}
 }
 
-// TestStartTLSNegotiateLDAP drives the LDAP StartTLS exchange. The server reads
-// the fixed extended request and replies with at least one byte, which the
-// best-effort negotiator treats as success. It also asserts the request begins
-// with the expected BER prefix.
+// TestStartTLSNegotiateLDAP drives the LDAP StartTLS exchange against a server
+// that sends a complete extendedResponse PDU, as real servers do. The
+// negotiator must consume the whole PDU: any unread response bytes would be
+// read by the TLS client afterwards and corrupt the handshake. The sentinel
+// byte the server writes after the PDU stands in for the first TLS byte and
+// must be the very next thing read from the connection.
 func TestStartTLSNegotiateLDAP(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	// Minimal successful extendedResponse: messageID 1, resultCode success,
+	// empty matchedDN and diagnosticMessage.
+	shortForm := []byte{
+		0x30, 0x0c, // SEQUENCE, length 12
+		0x02, 0x01, 0x01, // INTEGER 1 (messageID)
+		0x78, 0x07, // [APPLICATION 24] ExtendedResponse, length 7
+		0x0a, 0x01, 0x00, // ENUMERATED 0 (success)
+		0x04, 0x00, // OCTET STRING "" (matchedDN)
+		0x04, 0x00, // OCTET STRING "" (diagnosticMessage)
 	}
-	defer ln.Close()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-		buf := make([]byte, len(ldapStartTLSRequest))
-		if _, err := conn.Read(buf); err != nil {
-			t.Errorf("ldap server read: %v", err)
-			return
-		}
-		if buf[0] != 0x30 || buf[1] != 0x1d {
-			t.Errorf("ldap request prefix = % X; want 30 1D", buf[:2])
-		}
-		// Minimal extendedResp envelope; the negotiator only needs one byte.
-		if _, err := conn.Write([]byte{0x30, 0x0c}); err != nil {
-			t.Errorf("ldap server write: %v", err)
-		}
-	}()
+	// The same PDU with the outer length in long form (0x81 0x0c), which
+	// servers emit for larger responses.
+	longForm := append([]byte{0x30, 0x81, 0x0c}, shortForm[2:]...)
 
-	conn := dialScript(t, ln.Addr().String())
-	defer conn.Close()
-	if err := startTLSNegotiate(context.Background(), conn, "ldap", 2*time.Second); err != nil {
-		t.Fatalf("startTLSNegotiate(ldap) error: %v", err)
+	tests := []struct {
+		name string
+		pdu  []byte
+	}{
+		{name: "short-form length", pdu: shortForm},
+		{name: "long-form length", pdu: longForm},
 	}
-	<-done
+	const sentinel = 0x16 // first byte of a TLS handshake record
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer ln.Close()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+				buf := make([]byte, len(ldapStartTLSRequest))
+				if _, err := conn.Read(buf); err != nil {
+					t.Errorf("ldap server read: %v", err)
+					return
+				}
+				if buf[0] != 0x30 || buf[1] != 0x1d {
+					t.Errorf("ldap request prefix = % X; want 30 1D", buf[:2])
+				}
+				if _, err := conn.Write(append(tc.pdu, sentinel)); err != nil {
+					t.Errorf("ldap server write: %v", err)
+				}
+			}()
+
+			conn := dialScript(t, ln.Addr().String())
+			defer conn.Close()
+			if err := startTLSNegotiate(context.Background(), conn, "ldap", 2*time.Second); err != nil {
+				t.Fatalf("startTLSNegotiate(ldap) error: %v", err)
+			}
+			var next [1]byte
+			if _, err := io.ReadFull(conn, next[:]); err != nil {
+				t.Fatalf("read byte after negotiation: %v", err)
+			}
+			if next[0] != sentinel {
+				t.Errorf("byte after negotiation = 0x%02x; want 0x%02x (leftover PDU bytes would corrupt the TLS handshake)", next[0], sentinel)
+			}
+			<-done
+		})
+	}
 }
 
 // TestStartTLSNegotiateUnknownProto rejects an unknown protocol token.
@@ -1003,4 +1040,76 @@ func TestStartTLSNegotiateInjection(t *testing.T) {
 		t.Fatal("startTLSNegotiate(imap) = nil; want error for buffered data before TLS")
 	}
 	<-done
+}
+
+// TestCheckSANsCanceledContext verifies that names never dispatched because the
+// context was canceled are reported as not probed instead of surfacing as
+// zero-valued checks, which would render as (and be counted as) dead SANs.
+func TestCheckSANsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	names := make([]string, 40)
+	for i := range names {
+		names[i] = fmt.Sprintf("name%d.invalid", i)
+	}
+	checks, notProbed := checkSANs(ctx, names, "443", time.Second)
+
+	if got := len(checks) + notProbed; got != len(names) {
+		t.Errorf("len(checks)+notProbed = %d; want %d (every name accounted for)", got, len(names))
+	}
+	for i, c := range checks {
+		if c.Name == "" {
+			t.Fatalf("checks[%d].Name is empty; undispatched zero-valued check leaked into the results", i)
+		}
+	}
+}
+
+// TestProbeIPCertsCanceledContext verifies that addresses never dispatched
+// because the context was canceled are dropped from the results instead of
+// surfacing as zero-valued entries with no IP, which would render as empty
+// per-IP rows.
+func TestProbeIPCertsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ips := make([]string, 40)
+	for i := range ips {
+		ips[i] = fmt.Sprintf("192.0.2.%d", i+1)
+	}
+	certs, differ := probeIPCerts(ctx, "example.invalid", "443", "example.invalid", "", ips, time.Second)
+
+	for i, c := range certs {
+		if c.IP == "" {
+			t.Fatalf("certs[%d].IP is empty; undispatched zero-valued entry leaked into the results", i)
+		}
+	}
+	if differ {
+		t.Error("differ = true; no certificate was retrieved, so none can differ")
+	}
+}
+
+// TestSweepCanceledContext verifies that ports never dispatched because the
+// context was canceled are dropped from the results instead of surfacing as
+// zero-valued entries, which would render as a bogus port 0.
+func TestSweepCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ports := make([]int, 300)
+	for i := range ports {
+		ports[i] = 10000 + i
+	}
+	sr, err := Sweep(ctx, "192.0.2.1", SweepOptions{Ports: ports, Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Sweep error: %v", err)
+	}
+	if len(sr.Ports) > len(ports) {
+		t.Errorf("len(sr.Ports) = %d; want at most %d", len(sr.Ports), len(ports))
+	}
+	for i, p := range sr.Ports {
+		if p.Port < 10000 {
+			t.Fatalf("sr.Ports[%d].Port = %d; undispatched zero-valued entry leaked into the results", i, p.Port)
+		}
+	}
 }

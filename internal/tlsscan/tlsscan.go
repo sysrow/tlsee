@@ -127,8 +127,9 @@ type Report struct {
 	// DeadSANs counts non-wildcard SAN names that did not resolve or whose
 	// every resolved address was unreachable.
 	DeadSANs int `json:"deadSANs"`
-	// SANsNotProbed is the number of SAN names skipped by the liveness check
-	// because the certificate exceeded maxSANChecks names.
+	// SANsNotProbed is the number of SAN names skipped by the liveness check,
+	// either because the certificate exceeded maxSANChecks names or because
+	// the scan was canceled before they were probed.
 	SANsNotProbed int `json:"sansNotProbed,omitempty"`
 	// Warnings holds informational hygiene findings (weak TLS version, weak
 	// signature algorithm, weak RSA key, or a weak negotiated cipher suite).
@@ -184,6 +185,7 @@ type PortResult struct {
 	NotAfter      *time.Time `json:"notAfter,omitempty"`
 	DaysRemaining int        `json:"daysRemaining,omitempty"`
 	Expired       bool       `json:"expired,omitempty"`
+	NotYetValid   bool       `json:"notYetValid,omitempty"`
 	Error         string     `json:"error,omitempty"`
 }
 
@@ -419,12 +421,18 @@ func checkSANs(ctx context.Context, names []string, port string, timeout time.Du
 	var wg sync.WaitGroup
 	for i, name := range names {
 		// Acquire a slot, but stop dispatching promptly on cancellation
-		// (Ctrl-C/SIGTERM) instead of launching every remaining probe.
+		// (Ctrl-C/SIGTERM) instead of launching every remaining probe. Names
+		// never dispatched are counted as not probed rather than left as
+		// zero-valued checks, which would render as (and count as) dead SANs.
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
+			// Truncate only after the in-flight probes finish: the spawned
+			// goroutines read the checks slice header through their closure, so
+			// reassigning it before Wait would race with them.
+			notProbed += len(names) - i
 			wg.Wait()
-			return checks, notProbed
+			return checks[:i], notProbed
 		}
 		wg.Add(1)
 		go func(i int, name string) {
@@ -513,10 +521,17 @@ func probeIPCerts(ctx context.Context, host, port, sni, proto string, resolved [
 	sem := make(chan struct{}, ipCertConcurrency)
 	var wg sync.WaitGroup
 	for i, ip := range ips {
+		// Stop dispatching promptly on cancellation. Addresses never dispatched
+		// are dropped from the results: a zero-valued entry carries no address
+		// or error and would render as an empty per-IP row.
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
+			// Truncate only after the in-flight probes finish: the spawned
+			// goroutines read the results slice header through their closure, so
+			// reassigning it before Wait would race with them.
 			wg.Wait()
+			results = results[:i]
 			return results, ipCertsDiffer(results)
 		}
 		wg.Add(1)

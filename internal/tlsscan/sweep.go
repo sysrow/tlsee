@@ -95,10 +95,16 @@ func Sweep(ctx context.Context, host string, opts SweepOptions) (*SweepResult, e
 	for i, port := range ports {
 		// Stop dispatching promptly on cancellation (Ctrl-C/SIGTERM) rather than
 		// launching a probe for every remaining port (important for --full).
+		// Ports never dispatched are dropped from the results: a zero-valued
+		// entry would render as a bogus port 0.
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
+			// Truncate only after the in-flight probes finish: the spawned
+			// goroutines read the results slice header through their closure, so
+			// reassigning it before Wait would race with them.
 			wg.Wait()
+			results = results[:i]
 			sort.Slice(results, func(a, b int) bool { return results[a].Port < results[b].Port })
 			return &SweepResult{Host: host, Ports: results}, nil
 		}
@@ -167,6 +173,7 @@ func probePort(ctx context.Context, host string, port int, proto string, timeout
 	res.NotAfter = &notAfter
 	res.DaysRemaining = info.DaysRemaining
 	res.Expired = info.Expired
+	res.NotYetValid = info.NotYetValid
 	return res
 }
 

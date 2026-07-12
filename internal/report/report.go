@@ -106,21 +106,24 @@ func deadSANStatus(n int) string {
 // output (clearing the screen, overwriting earlier lines, hiding text).
 //
 // It iterates runes (not bytes) so legitimate multibyte UTF-8 in a subject or
-// SAN is preserved intact, and drops any control rune except the horizontal
-// tab, which tabwriter relies on for column layout. This covers C0, DEL, the
-// C1 range, and ESC. It is applied only on the text and table paths; the JSON
-// paths are left untouched because encoding/json already escapes control
-// characters.
+// SAN is preserved intact, and drops any control rune (C0, DEL, the C1 range,
+// and ESC). A horizontal tab is replaced with a space rather than dropped:
+// sanitize is applied to tabwriter cell content, where the layout tabs come
+// from the render format strings, so a tab inside a value would open a bogus
+// column and let a malicious value shift or forge the table. It is applied
+// only on the text and table paths; the JSON paths are left untouched because
+// encoding/json already escapes control characters.
 func sanitize(s string) string {
-	if !strings.ContainsFunc(s, func(r rune) bool {
-		return r != '\t' && unicode.IsControl(r)
-	}) {
+	if !strings.ContainsFunc(s, unicode.IsControl) {
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
-		if r == '\t' || !unicode.IsControl(r) {
+		switch {
+		case r == '\t':
+			b.WriteByte(' ')
+		case !unicode.IsControl(r):
 			b.WriteRune(r)
 		}
 	}
@@ -528,7 +531,7 @@ func WriteBatchJSON(w io.Writer, rows []BatchRow, quiet bool) error {
 // WriteSweepText renders a port sweep as a table sorted by port. Closed ports
 // and ports without TLS are reported alongside the certificates found. The CERT
 // column shows the leaf subject common name; the STATUS column summarizes
-// validity (VALID, EXPIRING Nd, EXPIRED, no TLS, or closed).
+// validity (VALID, EXPIRING Nd, EXPIRED, NOT YET VALID, no TLS, or closed).
 func WriteSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) {
 	fmt.Fprintf(w, "%s %s\n\n", paint("tlsee sweep", colorBold, color), sanitize(sr.Host))
 
@@ -554,6 +557,8 @@ func sweepStatus(p tlsscan.PortResult) (string, string) {
 		return "no TLS", colorYellow
 	case p.Expired:
 		return "EXPIRED", colorRed
+	case p.NotYetValid:
+		return "NOT YET VALID", colorRed
 	case p.DaysRemaining <= sweepWarnDays:
 		return fmt.Sprintf("EXPIRING %dd", p.DaysRemaining), colorYellow
 	default:

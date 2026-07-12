@@ -386,6 +386,9 @@ func TestSweepStatus(t *testing.T) {
 		{name: "closed", in: tlsscan.PortResult{Open: false}, want: "closed"},
 		{name: "open no tls", in: tlsscan.PortResult{Open: true, TLS: false}, want: "no TLS"},
 		{name: "expired", in: tlsscan.PortResult{Open: true, TLS: true, Expired: true, DaysRemaining: -1}, want: "EXPIRED"},
+		// A certificate whose NotBefore is in the future has a large positive
+		// DaysRemaining, so without an explicit check it would report VALID.
+		{name: "not yet valid", in: tlsscan.PortResult{Open: true, TLS: true, NotYetValid: true, DaysRemaining: 300}, want: "NOT YET VALID"},
 		{name: "expiring", in: tlsscan.PortResult{Open: true, TLS: true, DaysRemaining: 5}, want: "EXPIRING 5d"},
 		{name: "at boundary expiring", in: tlsscan.PortResult{Open: true, TLS: true, DaysRemaining: sweepWarnDays}, want: "EXPIRING 30d"},
 		{name: "valid", in: tlsscan.PortResult{Open: true, TLS: true, DaysRemaining: sweepWarnDays + 1}, want: "VALID"},
@@ -488,6 +491,20 @@ func TestWriteTextSanitizesControlBytes(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("sanitized output missing expected visible text %q\n---\n%s", want, out)
 		}
+	}
+}
+
+// TestSanitizeNeutralizesTabs verifies a tab inside an attacker-influenced
+// value cannot open a new tabwriter column. The layout tabs are supplied by
+// the render format strings, never by cell content, so a tab arriving inside
+// a certificate subject, SAN name, or error message is replaced with a space
+// to keep it from shifting or forging table columns.
+func TestSanitizeNeutralizesTabs(t *testing.T) {
+	if got, want := sanitize("CN=a\tVALID"), "CN=a VALID"; got != want {
+		t.Errorf("sanitize(%q) = %q; want %q", "CN=a\tVALID", got, want)
+	}
+	if got, want := sanitize("a\t\tb"), "a  b"; got != want {
+		t.Errorf("sanitize(%q) = %q; want %q", "a\t\tb", got, want)
 	}
 }
 

@@ -2,13 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/sysrow/tlsee/internal/report"
 	"github.com/sysrow/tlsee/internal/tlsscan"
@@ -26,14 +30,59 @@ example.com
 second.example.com
    # indented comment
 `
-	got := parseHostList(strings.NewReader(in))
+	got, err := parseHostList(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("parseHostList error: %v", err)
+	}
 	want := []string{"example.com", "spaced.example.com", "second.example.com"}
 	if !equalStrings(got, want) {
 		t.Errorf("parseHostList = %v; want %v", got, want)
 	}
 
-	if empty := parseHostList(strings.NewReader("\n# only comments\n\n")); len(empty) != 0 {
+	empty, err := parseHostList(strings.NewReader("\n# only comments\n\n"))
+	if err != nil {
+		t.Fatalf("parseHostList error: %v", err)
+	}
+	if len(empty) != 0 {
 		t.Errorf("parseHostList of comments-only = %v; want empty", empty)
+	}
+}
+
+// TestParseHostListReadError verifies a read failure surfaces as an error
+// instead of silently truncating the target list, which would make a cron
+// monitor quietly watch fewer hosts than the file lists.
+func TestParseHostListReadError(t *testing.T) {
+	readErr := errors.New("disk error")
+	if _, err := parseHostList(iotest.ErrReader(readErr)); !errors.Is(err, readErr) {
+		t.Errorf("parseHostList with failing reader = %v; want %v", err, readErr)
+	}
+}
+
+// TestScanTargetsCanceledContextFillsRows verifies that targets never
+// dispatched because the context was canceled still produce a row carrying an
+// error. A zero-valued row (no report, no error) violates BatchRow's invariant
+// and makes batch rendering and exit-code computation dereference a nil
+// report.
+func TestScanTargetsCanceledContextFillsRows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	targets := make([]string, 40)
+	for i := range targets {
+		targets[i] = "192.0.2.1:9"
+	}
+	rows := scanTargets(ctx, targets, tlsscan.Options{Timeout: time.Second}, 30)
+
+	if len(rows) != len(targets) {
+		t.Fatalf("len(rows) = %d; want %d", len(rows), len(targets))
+	}
+	for i, row := range rows {
+		if row.Err == "" && row.Report == nil {
+			t.Fatalf("rows[%d] has neither report nor error; batch rendering would panic", i)
+		}
+		if row.Host == "" {
+			t.Errorf("rows[%d].Host is empty; want the target preserved", i)
+		}
 	}
 }
 

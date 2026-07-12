@@ -291,17 +291,59 @@ var ldapStartTLSRequest = []byte{
 	'1', '4', '6', '6', '.', '2', '0', '0', '3', '7',
 }
 
-// startTLSLDAP sends the LDAP StartTLS extended request. The response is parsed
-// best-effort: if any bytes come back, the negotiation is treated as successful
-// and the caller proceeds to the TLS handshake (a failing TLS handshake will
-// surface a clear error). This avoids a full BER decoder for a best-effort path.
+// startTLSLDAP sends the LDAP StartTLS extended request and consumes the
+// server's complete extendedResponse PDU. The response is parsed best-effort:
+// only the outer SEQUENCE header is decoded, and a well-formed PDU is treated
+// as success, letting the TLS handshake surface a clear error if the server
+// actually refused. Consuming the whole PDU matters: any unread response bytes
+// would be read by the TLS client afterwards and corrupt the handshake.
 func startTLSLDAP(conn net.Conn) error {
 	if _, err := conn.Write(ldapStartTLSRequest); err != nil {
 		return fmt.Errorf("send ldap StartTLS: %w", err)
 	}
-	var resp [1]byte
-	if _, err := io.ReadFull(conn, resp[:]); err != nil {
+	n, err := readBERHeader(conn)
+	if err != nil {
+		return fmt.Errorf("read ldap StartTLS reply: %w", err)
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(n)); err != nil {
 		return fmt.Errorf("read ldap StartTLS reply: %w", err)
 	}
 	return nil
+}
+
+// readBERHeader reads a BER SEQUENCE tag and definite-form length from conn
+// and returns the content length that follows. Indefinite lengths are rejected
+// (LDAP requires the definite form), as is any length above maxReplyBytes, so
+// a malicious server cannot make the negotiator read an arbitrarily large
+// reply.
+func readBERHeader(conn net.Conn) (int, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return 0, err
+	}
+	if hdr[0] != 0x30 {
+		return 0, fmt.Errorf("not an LDAP message (tag 0x%02x)", hdr[0])
+	}
+	if hdr[1] < 0x80 {
+		return int(hdr[1]), nil
+	}
+	numBytes := int(hdr[1] & 0x7f)
+	if numBytes == 0 {
+		return 0, fmt.Errorf("indefinite BER length not allowed")
+	}
+	if numBytes > 4 {
+		return 0, fmt.Errorf("BER length of %d bytes too large", numBytes)
+	}
+	buf := make([]byte, numBytes)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return 0, err
+	}
+	var n uint64
+	for _, b := range buf {
+		n = n<<8 | uint64(b)
+	}
+	if n > maxReplyBytes {
+		return 0, fmt.Errorf("BER length %d exceeds %d-byte limit", n, maxReplyBytes)
+	}
+	return int(n), nil
 }
