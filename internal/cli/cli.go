@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/sysrow/tlsee/internal/report"
-	"github.com/sysrow/tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/tlsscan"
 )
 
 // version is the tool's version, printed by the version subcommand. It defaults

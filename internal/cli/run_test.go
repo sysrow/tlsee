@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/sysrow/tlsee/internal/report"
-	"github.com/sysrow/tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/tlsscan"
 )
 
 // TestParseHostList verifies blank lines, comment lines, and surrounding

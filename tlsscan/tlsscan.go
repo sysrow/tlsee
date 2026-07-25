@@ -5,6 +5,12 @@
 // certificate can be inspected, including expired, self-signed, or
 // wrong-host certificates. Trust and hostname matching are evaluated
 // separately and reported as independent facts.
+//
+// This package is the importable half of tlsee. Scan is its entry point: give
+// it a target and Options, and it returns one Report describing what the
+// endpoint presented. Callers that only want to know what a local service is
+// serving should set ResolveDNS and CheckSANs to false, which skips the
+// lookups that only make sense from outside the host.
 package tlsscan
 
 import (
