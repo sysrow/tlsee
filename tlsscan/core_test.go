@@ -9,8 +9,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1212,5 +1215,162 @@ func TestCountSANFindings(t *testing.T) {
 	}
 	if elsewhere != 2 {
 		t.Errorf("elsewhere = %d; want 2 (moved and maybe; same-cert does not count)", elsewhere)
+	}
+}
+
+// newSelfSignedCert generates a throwaway self-signed certificate so a test can
+// stand up a TLS server whose leaf differs from the one httptest shares across
+// all of its servers.
+func newSelfSignedCert(t *testing.T, cn string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// runLeafServer starts a TLS listener that completes handshakes and closes,
+// which is all a fingerprint probe needs. It returns the port it listens on.
+func runLeafServer(t *testing.T, cert tls.Certificate) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				tc := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{cert}})
+				_ = tc.Handshake()
+			}()
+		}
+	}()
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener address: %v", err)
+	}
+	return port
+}
+
+// leafFingerprint returns the SHA-256 fingerprint of a tls.Certificate's leaf,
+// in the same colon-separated form the scanner records on a report.
+func leafFingerprint(t *testing.T, cert tls.Certificate) string {
+	t.Helper()
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return certInfo(parsed, time.Now()).FingerprintSHA256
+}
+
+func TestClassifyOwnershipSameHostSkipsHandshake(t *testing.T) {
+	// Port 1 is closed, so any confirming handshake would fail and yield
+	// OwnershipUnverified. Getting OwnershipSameHost back proves the free path
+	// short-circuited and no handshake was attempted.
+	addrs := []AddrCheck{{IP: "192.0.2.10", Reachable: true}}
+	sctx := sanContext{
+		hostAddrs:   hostAddrSet("", []string{"192.0.2.10"}),
+		fingerprint: "AA:BB",
+	}
+	got := classifyOwnership(context.Background(), addrs, "name.test", "1", time.Second, sctx)
+	if got != OwnershipSameHost {
+		t.Errorf("Ownership = %q; want %q", got, OwnershipSameHost)
+	}
+}
+
+func TestClassifyOwnershipUnknownWithoutHostAddrs(t *testing.T) {
+	addrs := []AddrCheck{{IP: "192.0.2.10", Reachable: true}}
+	got := classifyOwnership(context.Background(), addrs, "name.test", "1", time.Second, sanContext{})
+	if got != OwnershipUnknown {
+		t.Errorf("Ownership = %q; want %q when the host's own addresses are unknown", got, OwnershipUnknown)
+	}
+}
+
+func TestClassifyOwnershipOtherCert(t *testing.T) {
+	other := newSelfSignedCert(t, "other.test")
+	port := runLeafServer(t, other)
+
+	// The name resolves to a reachable address that is not ours, and the
+	// endpoint there serves a certificate we do not recognize.
+	addrs := []AddrCheck{{IP: "127.0.0.1", Reachable: true}}
+	sctx := sanContext{
+		hostAddrs:   hostAddrSet("", []string{"192.0.2.10"}),
+		fingerprint: leafFingerprint(t, newSelfSignedCert(t, "ours.test")),
+	}
+	got := classifyOwnership(context.Background(), addrs, "moved.test", port, 2*time.Second, sctx)
+	if got != OwnershipOtherCert {
+		t.Errorf("Ownership = %q; want %q", got, OwnershipOtherCert)
+	}
+}
+
+func TestClassifyOwnershipSameCert(t *testing.T) {
+	shared := newSelfSignedCert(t, "shared.test")
+	port := runLeafServer(t, shared)
+
+	// A different address, but it serves our own certificate: a CDN or a second
+	// front-end, not a stale name.
+	addrs := []AddrCheck{{IP: "127.0.0.1", Reachable: true}}
+	sctx := sanContext{
+		hostAddrs:   hostAddrSet("", []string{"192.0.2.10"}),
+		fingerprint: leafFingerprint(t, shared),
+	}
+	got := classifyOwnership(context.Background(), addrs, "cdn.test", port, 2*time.Second, sctx)
+	if got != OwnershipSameCert {
+		t.Errorf("Ownership = %q; want %q", got, OwnershipSameCert)
+	}
+}
+
+func TestClassifyOwnershipUnverifiedWhenHandshakeFails(t *testing.T) {
+	// A listener that accepts and immediately closes never completes a TLS
+	// handshake, so the confirming probe fails and the verdict stays open.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener address: %v", err)
+	}
+
+	addrs := []AddrCheck{{IP: "127.0.0.1", Reachable: true}}
+	sctx := sanContext{
+		hostAddrs:   hostAddrSet("", []string{"192.0.2.10"}),
+		fingerprint: "AA:BB",
+	}
+	got := classifyOwnership(context.Background(), addrs, "maybe.test", port, 2*time.Second, sctx)
+	if got != OwnershipUnverified {
+		t.Errorf("Ownership = %q; want %q", got, OwnershipUnverified)
 	}
 }

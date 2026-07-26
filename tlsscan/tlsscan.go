@@ -579,6 +579,51 @@ func countSANFindings(checks []SANCheck) (dead, elsewhere int) {
 	return dead, elsewhere
 }
 
+// sanContext carries what a SAN liveness check needs to know about the scan it
+// belongs to, so a name can be classified as still pointing at the scanned host
+// or as having moved elsewhere. It is passed as one value rather than three
+// loose parameters because every field is needed together or not at all.
+type sanContext struct {
+	// hostAddrs is the scanned host's own address set. An empty set disables
+	// ownership classification: there is nothing to compare against.
+	hostAddrs map[netip.Addr]bool
+	// fingerprint is the scanned host's leaf SHA-256, compared against whatever
+	// a moved name is served by.
+	fingerprint string
+	// startTLS is the mechanism the confirming handshake must negotiate first,
+	// mirroring the main scan so --starttls targets classify correctly.
+	startTLS string
+}
+
+// classifyOwnership decides whether a reachable SAN name still points at the
+// scanned host. When the name's addresses are disjoint from the host's, one TLS
+// handshake to a reachable address settles whether it is a second front-end for
+// the same certificate or a host that has taken the name over. SNI is set to the
+// SAN name, not the scanned host, because the question is what that name is
+// served by.
+func classifyOwnership(ctx context.Context, addrs []AddrCheck, name, port string, timeout time.Duration, sctx sanContext) SANOwnership {
+	if len(sctx.hostAddrs) == 0 {
+		return OwnershipUnknown
+	}
+	sameHost, probeIP := classifyAddrs(addrs, sctx.hostAddrs)
+	if sameHost {
+		return OwnershipSameHost
+	}
+	if probeIP == "" {
+		return OwnershipUnknown
+	}
+
+	res := probeIPCert(ctx, probeIP, port, name, sctx.startTLS, timeout)
+	switch {
+	case res.Error != "" || res.FingerprintSHA256 == "":
+		return OwnershipUnverified
+	case res.FingerprintSHA256 == sctx.fingerprint:
+		return OwnershipSameCert
+	default:
+		return OwnershipOtherCert
+	}
+}
+
 // probeAddr reports whether a TCP connection to ip:port can be established
 // within timeout. It is the deterministic core of the liveness check and
 // takes an IP literal so it performs no name resolution itself.
