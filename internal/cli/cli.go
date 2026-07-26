@@ -105,7 +105,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		colorMode = fs.String("color", "auto", "color output: auto|always|never")
 		warnDays  = fs.Int("warn-days", 30, "warn when a certificate expires within this many days")
 		insecure  = fs.Bool("insecure", false, "always exit 0 even when the certificate has problems")
-		noCheck   = fs.Bool("no-check", false, "skip SAN liveness checks (resolve + TCP-probe of each certificate name)")
+		noCheck   = fs.Bool("no-check", false, "skip SAN checks (resolve, TCP-probe, and confirm each certificate name still points at the host)")
 		startTLS  = fs.String("starttls", "", "STARTTLS protocol to negotiate first: smtp|imap|pop3|ftp|postgres|ldap")
 		allIPs    = fs.Bool("all-ips", false, "connect to every resolved A/AAAA address and compare certificates")
 		table     = fs.Bool("table", false, "always print the summary table, even for a single target")
@@ -612,9 +612,11 @@ Sweep flags:
 
 By default tlsee also resolves and TCP-probes every DNS name in the
 certificate's SAN list and reports dead or stale entries (a name that no
-longer resolves, or whose host is unreachable on the port). Dead SANs are
-shown but do not change the exit code, which reflects the certificate's own
-validity. Use --no-check to skip this.
+longer resolves, or whose host is unreachable on the port). A name that
+resolves away from the scanned host is confirmed with one further handshake
+and reported as "elsewhere" when another certificate is served there. Dead and
+moved SANs are shown but do not change the exit code, which reflects the
+certificate's own validity. Use --no-check to skip this.
 
 Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon

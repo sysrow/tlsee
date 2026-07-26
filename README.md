@@ -168,13 +168,25 @@ POP3, LDAP, FTP, and PostgreSQL).
 
 For each DNS name in the certificate's SAN list, `tlsee` reports one of:
 
-| State                   | Meaning                                                        |
-| ----------------------- | ------------------------------------------------------------- |
-| `open`                  | Resolves and every address accepts a connection on the port.  |
-| `partial`               | Resolves and some addresses are reachable (e.g. IPv4 up, IPv6 down). |
-| `unreachable`           | Resolves but no address accepts a connection.                 |
-| `NO DNS (stale?)`       | Does not resolve at all -- likely a stale name on the cert.   |
-| `wildcard (not probed)` | A `*.` name, which cannot be resolved directly.               |
+| State                        | Meaning                                                        |
+| ---------------------------- | ------------------------------------------------------------- |
+| `open`                       | Resolves to the scanned host and every address accepts a connection on the port. |
+| `partial`                    | Resolves to the scanned host and some addresses are reachable (e.g. IPv4 up, IPv6 down). |
+| `open (other IP, same cert)` | Resolves to a different address, but that endpoint serves the same certificate (a CDN or second front-end). |
+| `elsewhere (other cert)`     | Resolves to a different address serving a different certificate: the name has moved away and is stale on this certificate. |
+| `elsewhere (unverified)`     | Resolves to a different address, but the confirming handshake failed, so it is unclear which. |
+| `unreachable`                | Resolves but no address accepts a connection.                 |
+| `NO DNS (stale?)`            | Does not resolve at all -- likely a stale name on the cert.   |
+| `wildcard (not probed)`      | A `*.` name, which cannot be resolved directly.               |
+
+Each name is also checked against the scanned host itself. When a name resolves
+to addresses the host does not have, `tlsee` opens one further handshake to that
+address (presenting the name as SNI) and compares the certificate: the same leaf
+means a second front-end, a different leaf means the name has moved to another
+host and is stale on this certificate. Names that have moved are counted in the
+status headline as `N SANS ELSEWHERE` and shown in magenta. Like dead SANs they
+are advisory and do **not** change the exit code. The comparison costs no extra
+connection for names that still point at the scanned host.
 
 Names that are `unreachable` or `NO DNS` are counted as **dead SANs** and shown
 in the status headline. Each probe uses a short timeout (capped at 3s) and runs

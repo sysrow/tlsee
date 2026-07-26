@@ -74,8 +74,17 @@ main.go  →  internal/cli  →  tlsscan  →  internal/report
   connection failures. `Report.Healthy()` is the single source of truth shared
   by the exit code, the `--quiet` row filter, and the status headline — don't
   fork that logic.
-- **Dead SANs and hygiene warnings are advisory only**: they appear in output
-  but must never change the exit code or turn the headline red.
+- **Dead SANs, moved SANs, and hygiene warnings are advisory only**: they appear
+  in output but must never change the exit code or turn the headline red.
+  `sanAdvisory` in `internal/report` is where the SAN notes are composed for the
+  headline; it appends without touching the color the real problems set.
+- **Magenta is reserved for one condition**: a SAN name that no longer points at
+  the scanned host. Keeping it exclusive is what makes a moved name distinct
+  from a healthy one (green) and a dead one (red). Do not reuse it elsewhere.
+- **SAN ownership classification is free unless something looks wrong**: address
+  sets are compared from data the scan already has, and a confirming handshake
+  runs only for a name whose addresses are disjoint from the host's. Keep that
+  ordering — reversing it puts a handshake on every name of every certificate.
 - **`Scan` runs post-handshake enrichment on the caller's `ctx`, not on
   `scanCtx`.** `scanCtx` carries the single `--timeout` budget for
   connect + STARTTLS + handshake and is already depleted by then; reusing it for
