@@ -599,3 +599,77 @@ func TestWriteBatchTableNoteAlignment(t *testing.T) {
 		}
 	}
 }
+
+func TestSANLivenessOwnershipStates(t *testing.T) {
+	tests := []struct {
+		name      string
+		check     tlsscan.SANCheck
+		wantState string
+		wantColor string
+	}{
+		{
+			name:      "moved name is magenta",
+			check:     tlsscan.SANCheck{Name: "moved.test", Resolved: true, Reachable: true, Ownership: tlsscan.OwnershipOtherCert, Addrs: []tlsscan.AddrCheck{{IP: "198.51.100.5", Reachable: true}}},
+			wantState: "elsewhere (other cert)",
+			wantColor: colorMagenta,
+		},
+		{
+			name:      "unconfirmed name is magenta",
+			check:     tlsscan.SANCheck{Name: "maybe.test", Resolved: true, Reachable: true, Ownership: tlsscan.OwnershipUnverified, Addrs: []tlsscan.AddrCheck{{IP: "198.51.100.6", Reachable: true}}},
+			wantState: "elsewhere (unverified)",
+			wantColor: colorMagenta,
+		},
+		{
+			name:      "another address serving our certificate stays green",
+			check:     tlsscan.SANCheck{Name: "cdn.test", Resolved: true, Reachable: true, Ownership: tlsscan.OwnershipSameCert, Addrs: []tlsscan.AddrCheck{{IP: "198.51.100.7", Reachable: true}}},
+			wantState: "open (other IP, same cert)",
+			wantColor: colorGreen,
+		},
+		{
+			name:      "same host is unchanged",
+			check:     tlsscan.SANCheck{Name: "ok.test", Resolved: true, Reachable: true, Ownership: tlsscan.OwnershipSameHost, Addrs: []tlsscan.AddrCheck{{IP: "192.0.2.10", Reachable: true}}},
+			wantState: "open",
+			wantColor: colorGreen,
+		},
+		{
+			name:      "unclassified partial name is unchanged",
+			check:     tlsscan.SANCheck{Name: "half.test", Resolved: true, Reachable: true, Addrs: []tlsscan.AddrCheck{{IP: "192.0.2.10", Reachable: true}, {IP: "192.0.2.11"}}},
+			wantState: "partial",
+			wantColor: colorYellow,
+		},
+		{
+			name:      "unreachable name stays red and is never classified",
+			check:     tlsscan.SANCheck{Name: "down.test", Resolved: true, Addrs: []tlsscan.AddrCheck{{IP: "192.0.2.12"}}},
+			wantState: "unreachable",
+			wantColor: colorRed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, state, color := sanLiveness(tt.check)
+			if state != tt.wantState {
+				t.Errorf("state = %q; want %q", state, tt.wantState)
+			}
+			if color != tt.wantColor {
+				t.Errorf("color = %q; want %q", color, tt.wantColor)
+			}
+		})
+	}
+}
+
+func TestSANLivenessMagentaSuppressedWithoutColor(t *testing.T) {
+	r := fixedReport()
+	r.SANChecks = []tlsscan.SANCheck{
+		{Name: "moved.test", Resolved: true, Reachable: true, Ownership: tlsscan.OwnershipOtherCert, Addrs: []tlsscan.AddrCheck{{IP: "198.51.100.5", Reachable: true}}},
+	}
+	var buf bytes.Buffer
+	WriteText(&buf, r, false)
+	out := buf.String()
+	if !strings.Contains(out, "elsewhere (other cert)") {
+		t.Error("moved SAN state missing from monochrome output")
+	}
+	if hasControlBytes(out) {
+		t.Error("monochrome output contains ANSI escapes")
+	}
+}

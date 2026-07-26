@@ -25,6 +25,11 @@ const (
 	colorGreen  = "\033[32m"
 	colorYellow = "\033[33m"
 	colorBold   = "\033[1m"
+	// colorMagenta is reserved for one condition: a SAN name that no longer
+	// points at the scanned host. Keeping it exclusive is what makes a moved
+	// name visually distinct from a healthy one (green) and from a dead or
+	// degraded one (red, yellow).
+	colorMagenta = "\033[35m"
 )
 
 // sweepWarnDays is the days-remaining threshold below which a sweep reports a
@@ -581,6 +586,11 @@ func WriteSweepJSON(w io.Writer, sr *tlsscan.SweepResult) error {
 // reachable, "partial" when only some are (for example an unreachable IPv6
 // address alongside a reachable IPv4 one), "unreachable" when none are, and
 // "NO DNS" when it does not resolve at all. Wildcard names are not probed.
+//
+// A reachable name that resolves away from the scanned host reports its
+// ownership instead of open/partial: that a name has moved matters more than
+// one of its addresses being down, and the per-address detail is not lost since
+// the address column still marks the specific address "(down)".
 func sanLiveness(c tlsscan.SANCheck) (addrs, state, color string) {
 	if c.Wildcard {
 		return "-", "wildcard (not probed)", ""
@@ -603,14 +613,23 @@ func sanLiveness(c tlsscan.SANCheck) (addrs, state, color string) {
 	}
 	addrs = strings.Join(parts, ", ")
 
-	switch {
-	case !anyUp:
+	if !anyUp {
 		return addrs, "unreachable", colorRed
-	case !allUp:
-		return addrs, "partial", colorYellow
-	default:
-		return addrs, "open", colorGreen
 	}
+
+	switch c.Ownership {
+	case tlsscan.OwnershipOtherCert:
+		return addrs, "elsewhere (other cert)", colorMagenta
+	case tlsscan.OwnershipUnverified:
+		return addrs, "elsewhere (unverified)", colorMagenta
+	case tlsscan.OwnershipSameCert:
+		return addrs, "open (other IP, same cert)", colorGreen
+	}
+
+	if !allUp {
+		return addrs, "partial", colorYellow
+	}
+	return addrs, "open", colorGreen
 }
 
 // expiryColor chooses the color for the validity row based on the
