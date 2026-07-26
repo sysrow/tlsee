@@ -673,3 +673,18 @@ func TestSANLivenessMagentaSuppressedWithoutColor(t *testing.T) {
 		t.Error("monochrome output contains ANSI escapes")
 	}
 }
+
+func TestBatchNoteReportsMovedSANs(t *testing.T) {
+	rows := batchRows()
+	for i := range rows {
+		if rows[i].Report != nil {
+			rows[i].Report.SANsElsewhere = 2
+			break
+		}
+	}
+	var buf bytes.Buffer
+	WriteBatchTable(&buf, rows, false, false)
+	if !strings.Contains(buf.String(), "2 elsewhere") {
+		t.Errorf("batch table missing the moved-SAN note; got:\n%s", buf.String())
+	}
+}

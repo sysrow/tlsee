@@ -314,3 +314,62 @@ func TestWriteJSON(t *testing.T) {
 		t.Errorf("JSON output contains ANSI escapes:\n%s", buf.String())
 	}
 }
+
+func TestSummarizeElsewhereAdvisory(t *testing.T) {
+	tests := []struct {
+		name      string
+		dead      int
+		elsewhere int
+		wantText  string
+		wantColor string
+	}{
+		{name: "clean", dead: 0, elsewhere: 0, wantText: "VALID", wantColor: colorGreen},
+		{name: "moved only", dead: 0, elsewhere: 3, wantText: "VALID | 3 SANS ELSEWHERE", wantColor: colorYellow},
+		{name: "one moved", dead: 0, elsewhere: 1, wantText: "VALID | 1 SAN ELSEWHERE", wantColor: colorYellow},
+		{name: "dead and moved", dead: 1, elsewhere: 2, wantText: "VALID | 1 DEAD SAN | 2 SANS ELSEWHERE", wantColor: colorYellow},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := fixedReport()
+			r.DeadSANs = tt.dead
+			r.SANsElsewhere = tt.elsewhere
+			st := summarize(r)
+			if st.text != tt.wantText {
+				t.Errorf("text = %q; want %q", st.text, tt.wantText)
+			}
+			if st.color != tt.wantColor {
+				t.Errorf("color = %q; want %q", st.color, tt.wantColor)
+			}
+		})
+	}
+}
+
+func TestSummarizeMovedSANNeverTurnsHeadlineRed(t *testing.T) {
+	// A moved SAN is advisory: it must never escalate the headline to red, the
+	// color reserved for actual certificate problems.
+	r := fixedReport()
+	r.SANsElsewhere = 5
+	if st := summarize(r); st.color == colorRed {
+		t.Error("a moved SAN turned the headline red")
+	}
+	if st := summarize(r); st.color == colorMagenta {
+		t.Error("headline uses magenta; magenta is reserved for the SAN liveness rows")
+	}
+}
+
+func TestSummarizeRealProblemOutranksMovedSAN(t *testing.T) {
+	r := fixedReport()
+	r.ChainTrusted = false
+	r.SANsElsewhere = 2
+	st := summarize(r)
+	if st.color != colorRed {
+		t.Errorf("color = %q; want red when the chain is untrusted", st.color)
+	}
+	if !strings.Contains(st.text, "UNTRUSTED CHAIN") {
+		t.Errorf("text = %q; want it to report the untrusted chain", st.text)
+	}
+	if !strings.Contains(st.text, "2 SANS ELSEWHERE") {
+		t.Errorf("text = %q; want the moved-SAN advisory appended", st.text)
+	}
+}

@@ -47,12 +47,13 @@ type status struct {
 // status. The most severe problem wins; an otherwise healthy certificate
 // that is expiring within WarnDays is reported as expiring soon.
 //
-// Dead SANs are a non-red advisory, not a certificate problem: they do not
-// change the exit code and a dead-SAN-only certificate stays "healthy" for
-// --quiet, so they must neither erase the healthy VALID indicator nor turn
-// the headline red. When the certificate is otherwise valid, the headline
-// reads "VALID | N DEAD SAN(S)" in yellow; when there is already a real
-// problem, the dead-SAN advisory is appended without escalating the color.
+// Dead SANs and SAN names that have moved to another host are non-red
+// advisories, not certificate problems: they do not change the exit code and a
+// certificate carrying only those stays "healthy" for --quiet, so they must
+// neither erase the healthy VALID indicator nor turn the headline red. When the
+// certificate is otherwise valid the headline reads "VALID | <advisory>" in
+// yellow; when there is already a real problem the advisory is appended without
+// escalating the color.
 func summarize(r *tlsscan.Report) status {
 	var problems []string
 	worst := colorYellow
@@ -77,20 +78,22 @@ func summarize(r *tlsscan.Report) status {
 		problems = append(problems, expiringStatus(r.Leaf.DaysRemaining))
 	}
 
+	advisory := sanAdvisory(r)
+
 	// If nothing above flagged a real certificate problem, the certificate is
-	// healthy. A dead-SAN advisory is then appended to the VALID headline as a
+	// healthy. The SAN advisory is then appended to the VALID headline as a
 	// non-red note rather than replacing it.
 	if len(problems) == 0 {
-		if r.DeadSANs > 0 {
-			return status{text: "VALID | " + deadSANStatus(r.DeadSANs), color: colorYellow}
+		if advisory != "" {
+			return status{text: "VALID | " + advisory, color: colorYellow}
 		}
 		return status{text: "VALID", color: colorGreen}
 	}
 
-	// A real problem exists. Append the dead-SAN advisory for visibility, but do
-	// not let it escalate the color beyond what the real problems already set.
-	if r.DeadSANs > 0 {
-		problems = append(problems, deadSANStatus(r.DeadSANs))
+	// A real problem exists. Append the SAN advisory for visibility, but do not
+	// let it escalate the color beyond what the real problems already set.
+	if advisory != "" {
+		problems = append(problems, advisory)
 	}
 	return status{text: strings.Join(problems, " | "), color: worst}
 }
@@ -101,6 +104,31 @@ func deadSANStatus(n int) string {
 		return "1 DEAD SAN"
 	}
 	return fmt.Sprintf("%d DEAD SANS", n)
+}
+
+// elsewhereSANStatus renders the count of SAN names that no longer point at the
+// scanned host, for the headline.
+func elsewhereSANStatus(n int) string {
+	if n == 1 {
+		return "1 SAN ELSEWHERE"
+	}
+	return fmt.Sprintf("%d SANS ELSEWHERE", n)
+}
+
+// sanAdvisory renders the advisory SAN notes for the headline: names that are
+// dead and names that have moved to another host. Both are informational and
+// must never escalate the headline color, so callers append the result without
+// changing the color the real problems already set. It returns "" when there is
+// nothing to report.
+func sanAdvisory(r *tlsscan.Report) string {
+	var parts []string
+	if r.DeadSANs > 0 {
+		parts = append(parts, deadSANStatus(r.DeadSANs))
+	}
+	if r.SANsElsewhere > 0 {
+		parts = append(parts, elsewhereSANStatus(r.SANsElsewhere))
+	}
+	return strings.Join(parts, " | ")
 }
 
 // sanitize strips control characters from untrusted, certificate- or
@@ -334,12 +362,12 @@ type BatchRow struct {
 	Err    string
 }
 
-// batchStatus is the per-row status word, day count, dead-SAN count, and color
+// batchStatus is the per-row status word, day count, advisory note, and color
 // derived from a BatchRow for the summary table.
 type batchStatus struct {
 	status string
 	days   string
-	dead   string
+	note   string
 	color  string
 }
 
@@ -348,22 +376,27 @@ type batchStatus struct {
 // summarize but as compact one-word column values.
 func rowStatus(row BatchRow) batchStatus {
 	if row.Err != "" {
-		return batchStatus{status: "ERROR", days: "ERR", dead: "-", color: colorRed}
+		return batchStatus{status: "ERROR", days: "ERR", note: "-", color: colorRed}
 	}
 	r := row.Report
-	dead := fmt.Sprintf("%d", r.DeadSANs)
+	// The note stays a bare dead count in the common case, and only widens to
+	// name both figures when some name has moved away from the host.
+	note := fmt.Sprintf("%d", r.DeadSANs)
+	if r.SANsElsewhere > 0 {
+		note = fmt.Sprintf("%d dead, %d elsewhere", r.DeadSANs, r.SANsElsewhere)
+	}
 	days := fmt.Sprintf("%d", r.Leaf.DaysRemaining)
 	switch {
 	case r.Leaf.Expired, r.Leaf.NotYetValid:
-		return batchStatus{status: "EXPIRED", days: days, dead: dead, color: colorRed}
+		return batchStatus{status: "EXPIRED", days: days, note: note, color: colorRed}
 	case !r.ChainTrusted:
-		return batchStatus{status: "UNTRUSTED", days: days, dead: dead, color: colorRed}
+		return batchStatus{status: "UNTRUSTED", days: days, note: note, color: colorRed}
 	case !r.HostnameMatch:
-		return batchStatus{status: "MISMATCH", days: days, dead: dead, color: colorRed}
+		return batchStatus{status: "MISMATCH", days: days, note: note, color: colorRed}
 	case r.Leaf.DaysRemaining <= r.WarnDays:
-		return batchStatus{status: "EXPIRING", days: days, dead: dead, color: colorYellow}
+		return batchStatus{status: "EXPIRING", days: days, note: note, color: colorYellow}
 	default:
-		return batchStatus{status: "VALID", days: days, dead: dead, color: colorGreen}
+		return batchStatus{status: "VALID", days: days, note: note, color: colorGreen}
 	}
 }
 
@@ -426,7 +459,7 @@ func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	for i, row := range visible {
 		bs := rowStatus(row)
 		statuses[i] = bs
-		note := bs.dead
+		note := bs.note
 		if row.Err != "" {
 			note = sanitize(row.Err)
 		}
