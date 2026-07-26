@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -98,15 +99,41 @@ type IPCert struct {
 	Error             string     `json:"error,omitempty"`
 }
 
+// SANOwnership classifies whether a SAN name still points at the scanned host.
+// It is evaluated only for names that resolve and are reachable; a wildcard, an
+// unresolved name, and an unreachable name all keep OwnershipUnknown.
+type SANOwnership string
+
+const (
+	// OwnershipUnknown means the comparison could not be made, because the
+	// scanned host's own addresses are unknown or the name was never probed.
+	OwnershipUnknown SANOwnership = ""
+	// OwnershipSameHost means the name resolves to at least one address that
+	// the scanned host also resolves to.
+	OwnershipSameHost SANOwnership = "same-host"
+	// OwnershipSameCert means the name resolves elsewhere, but that endpoint
+	// presents the same leaf certificate: a CDN or a second front-end.
+	OwnershipSameCert SANOwnership = "same-cert"
+	// OwnershipOtherCert means the name resolves elsewhere and that endpoint
+	// presents a different certificate: the name has moved away, and carrying
+	// it on this certificate is stale.
+	OwnershipOtherCert SANOwnership = "other-cert"
+	// OwnershipUnverified means the name resolves elsewhere but the confirming
+	// handshake failed, so which of the two it is remains unclear.
+	OwnershipUnverified SANOwnership = "unverified"
+)
+
 // SANCheck is the liveness result for one DNS name from a certificate's SAN
 // list: whether it resolves, and whether any resolved address accepts a TCP
 // connection on the scanned port. Wildcard names are flagged and not probed.
 type SANCheck struct {
-	Name      string      `json:"name"`
-	Wildcard  bool        `json:"wildcard"`
-	Resolved  bool        `json:"resolved"`
-	Reachable bool        `json:"reachable"`
-	Addrs     []AddrCheck `json:"addrs,omitempty"`
+	Name      string `json:"name"`
+	Wildcard  bool   `json:"wildcard"`
+	Resolved  bool   `json:"resolved"`
+	Reachable bool   `json:"reachable"`
+	// Ownership records whether this name still points at the scanned host.
+	Ownership SANOwnership `json:"ownership,omitempty"`
+	Addrs     []AddrCheck  `json:"addrs,omitempty"`
 }
 
 // Report is the full result of scanning a target.
@@ -133,6 +160,12 @@ type Report struct {
 	// DeadSANs counts non-wildcard SAN names that did not resolve or whose
 	// every resolved address was unreachable.
 	DeadSANs int `json:"deadSANs"`
+	// SANsElsewhere counts names that resolve away from the scanned host and
+	// are served by a different certificate (or could not be confirmed). Like
+	// DeadSANs it is advisory and never feeds the exit code. It is always
+	// serialized so a consumer can tell "checked, none moved" from a scan that
+	// did not run the check.
+	SANsElsewhere int `json:"sansElsewhere"`
 	// SANsNotProbed is the number of SAN names skipped by the liveness check,
 	// either because the certificate exceeded maxSANChecks names or because
 	// the scan was canceled before they were probed.
@@ -481,6 +514,69 @@ func checkSAN(ctx context.Context, name, port string, timeout time.Duration) SAN
 		sc.Addrs = append(sc.Addrs, ac)
 	}
 	return sc
+}
+
+// hostAddrSet builds the set of addresses belonging to the scanned host, used
+// to decide whether a SAN name still points at it. resolved holds the addresses
+// DNS returned for the host; an IP-literal target contributes itself, since no
+// lookup runs for one. Addresses are keyed as netip.Addr rather than strings so
+// two spellings of one IPv6 address compare equal, and unmapped so an
+// IPv4-in-IPv6 form matches its plain IPv4 counterpart. Unparseable entries are
+// skipped: a malformed address should not fail an otherwise good scan.
+func hostAddrSet(host string, resolved []string) map[netip.Addr]bool {
+	set := make(map[netip.Addr]bool, len(resolved)+1)
+	for _, s := range resolved {
+		if a, err := netip.ParseAddr(s); err == nil {
+			set[a.Unmap()] = true
+		}
+	}
+	if a, err := netip.ParseAddr(host); err == nil {
+		set[a.Unmap()] = true
+	}
+	return set
+}
+
+// classifyAddrs reports whether any of a SAN name's addresses belongs to the
+// scanned host, and when none does, which address a confirming handshake should
+// use. probeIP is the first reachable address, or "" when none is reachable (in
+// which case the name is already reported as unreachable and needs no further
+// diagnosis).
+func classifyAddrs(addrs []AddrCheck, hostAddrs map[netip.Addr]bool) (sameHost bool, probeIP string) {
+	for _, ac := range addrs {
+		a, err := netip.ParseAddr(ac.IP)
+		if err != nil {
+			continue
+		}
+		if hostAddrs[a.Unmap()] {
+			return true, ""
+		}
+		if ac.Reachable && probeIP == "" {
+			probeIP = ac.IP
+		}
+	}
+	return false, probeIP
+}
+
+// countSANFindings tallies the two advisory SAN counters from completed checks.
+// A dead name is a non-wildcard name that did not resolve or whose every address
+// was unreachable. An elsewhere name resolves away from the scanned host and is
+// served by a different certificate, or could not be confirmed either way; a
+// name confirmed to serve our own certificate from another address does not
+// count, since a CDN front-end is not a stale entry.
+func countSANFindings(checks []SANCheck) (dead, elsewhere int) {
+	for _, c := range checks {
+		if c.Wildcard {
+			continue
+		}
+		if !c.Resolved || !c.Reachable {
+			dead++
+			continue
+		}
+		if c.Ownership == OwnershipOtherCert || c.Ownership == OwnershipUnverified {
+			elsewhere++
+		}
+	}
+	return dead, elsewhere
 }
 
 // probeAddr reports whether a TCP connection to ip:port can be established

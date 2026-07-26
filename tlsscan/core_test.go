@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -1111,5 +1112,105 @@ func TestSweepCanceledContext(t *testing.T) {
 		if p.Port < 10000 {
 			t.Fatalf("sr.Ports[%d].Port = %d; undispatched zero-valued entry leaked into the results", i, p.Port)
 		}
+	}
+}
+
+func TestHostAddrSet(t *testing.T) {
+	// A hostname target contributes only its resolved addresses; an IP-literal
+	// target contributes itself, since no lookup ran for it.
+	set := hostAddrSet("example.test", []string{"192.0.2.10", "2001:db8::1"})
+	if len(set) != 2 {
+		t.Fatalf("len(set) = %d; want 2", len(set))
+	}
+	if !set[netip.MustParseAddr("192.0.2.10")] {
+		t.Error("resolved IPv4 address missing from the set")
+	}
+
+	literal := hostAddrSet("192.0.2.20", nil)
+	if !literal[netip.MustParseAddr("192.0.2.20")] {
+		t.Error("IP-literal target should contribute itself as the host address")
+	}
+
+	// A malformed entry is skipped rather than failing the scan.
+	if got := len(hostAddrSet("not-an-ip", []string{"garbage"})); got != 0 {
+		t.Errorf("len = %d; want 0 for unparseable input", got)
+	}
+}
+
+func TestClassifyAddrs(t *testing.T) {
+	tests := []struct {
+		name         string
+		addrs        []AddrCheck
+		hostAddrs    []string
+		wantSameHost bool
+		wantProbeIP  string
+	}{
+		{
+			name:         "shared address means the name still points at the host",
+			addrs:        []AddrCheck{{IP: "192.0.2.10", Reachable: true}},
+			hostAddrs:    []string{"192.0.2.10"},
+			wantSameHost: true,
+			wantProbeIP:  "",
+		},
+		{
+			name:         "disjoint addresses select the first reachable one to probe",
+			addrs:        []AddrCheck{{IP: "198.51.100.5"}, {IP: "198.51.100.6", Reachable: true}},
+			hostAddrs:    []string{"192.0.2.10"},
+			wantSameHost: false,
+			wantProbeIP:  "198.51.100.6",
+		},
+		{
+			name:         "disjoint but nothing reachable yields no probe address",
+			addrs:        []AddrCheck{{IP: "198.51.100.5"}},
+			hostAddrs:    []string{"192.0.2.10"},
+			wantSameHost: false,
+			wantProbeIP:  "",
+		},
+		{
+			name:         "two spellings of one IPv6 address are the same address",
+			addrs:        []AddrCheck{{IP: "2001:0db8:0000:0000:0000:0000:0000:0001", Reachable: true}},
+			hostAddrs:    []string{"2001:db8::1"},
+			wantSameHost: true,
+			wantProbeIP:  "",
+		},
+		{
+			name:         "unparseable address is skipped",
+			addrs:        []AddrCheck{{IP: "garbage", Reachable: true}, {IP: "198.51.100.7", Reachable: true}},
+			hostAddrs:    []string{"192.0.2.10"},
+			wantSameHost: false,
+			wantProbeIP:  "198.51.100.7",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := hostAddrSet("", tt.hostAddrs)
+			sameHost, probeIP := classifyAddrs(tt.addrs, set)
+			if sameHost != tt.wantSameHost {
+				t.Errorf("sameHost = %v; want %v", sameHost, tt.wantSameHost)
+			}
+			if probeIP != tt.wantProbeIP {
+				t.Errorf("probeIP = %q; want %q", probeIP, tt.wantProbeIP)
+			}
+		})
+	}
+}
+
+func TestCountSANFindings(t *testing.T) {
+	checks := []SANCheck{
+		{Name: "wild", Wildcard: true},
+		{Name: "ok", Resolved: true, Reachable: true, Ownership: OwnershipSameHost},
+		{Name: "cdn", Resolved: true, Reachable: true, Ownership: OwnershipSameCert},
+		{Name: "nodns"},
+		{Name: "down", Resolved: true},
+		{Name: "moved", Resolved: true, Reachable: true, Ownership: OwnershipOtherCert},
+		{Name: "maybe", Resolved: true, Reachable: true, Ownership: OwnershipUnverified},
+	}
+	dead, elsewhere := countSANFindings(checks)
+	if dead != 2 {
+		t.Errorf("dead = %d; want 2 (nodns and down; wildcards never count)", dead)
+	}
+	if elsewhere != 2 {
+		t.Errorf("elsewhere = %d; want 2 (moved and maybe; same-cert does not count)", elsewhere)
 	}
 }
