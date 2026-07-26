@@ -375,12 +375,13 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 	// whose host is down). Probes run concurrently with their own short
 	// timeout so this never dominates scan latency.
 	if opts.CheckSANs && len(report.Leaf.DNSNames) > 0 {
-		report.SANChecks, report.SANsNotProbed = checkSANs(ctx, report.Leaf.DNSNames, port, probeTimeout(timeout))
-		for _, c := range report.SANChecks {
-			if !c.Wildcard && (!c.Resolved || !c.Reachable) {
-				report.DeadSANs++
-			}
+		sctx := sanContext{
+			hostAddrs:   hostAddrSet(host, report.ResolvedIPs),
+			fingerprint: report.Leaf.FingerprintSHA256,
+			startTLS:    opts.StartTLS,
 		}
+		report.SANChecks, report.SANsNotProbed = checkSANs(ctx, report.Leaf.DNSNames, port, probeTimeout(timeout), sctx)
+		report.DeadSANs, report.SANsElsewhere = countSANFindings(report.SANChecks)
 	}
 
 	// Hygiene warnings are derived from already-known facts about the leaf and
@@ -450,7 +451,7 @@ func probeTimeout(timeout time.Duration) time.Duration {
 // checkSANs probes every name concurrently, preserving input order. Each
 // goroutine writes its own slot, so no synchronization beyond the WaitGroup
 // is needed.
-func checkSANs(ctx context.Context, names []string, port string, timeout time.Duration) (checks []SANCheck, notProbed int) {
+func checkSANs(ctx context.Context, names []string, port string, timeout time.Duration, sctx sanContext) (checks []SANCheck, notProbed int) {
 	if len(names) > maxSANChecks {
 		notProbed = len(names) - maxSANChecks
 		names = names[:maxSANChecks]
@@ -477,7 +478,7 @@ func checkSANs(ctx context.Context, names []string, port string, timeout time.Du
 		go func(i int, name string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			checks[i] = checkSAN(ctx, name, port, timeout)
+			checks[i] = checkSAN(ctx, name, port, timeout, sctx)
 		}(i, name)
 	}
 	wg.Wait()
@@ -487,7 +488,7 @@ func checkSANs(ctx context.Context, names []string, port string, timeout time.Du
 // checkSAN resolves a single SAN name and TCP-probes each resolved address.
 // Wildcard names (for example "*.example.com") cannot be resolved as-is, so
 // they are reported but not probed.
-func checkSAN(ctx context.Context, name, port string, timeout time.Duration) SANCheck {
+func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sctx sanContext) SANCheck {
 	sc := SANCheck{Name: name}
 	if strings.HasPrefix(name, "*.") {
 		sc.Wildcard = true
@@ -512,6 +513,13 @@ func checkSAN(ctx context.Context, name, port string, timeout time.Duration) SAN
 			sc.Reachable = true
 		}
 		sc.Addrs = append(sc.Addrs, ac)
+	}
+
+	// Ownership is only meaningful for a name that resolves and answers: an
+	// unresolved or unreachable name is already reported as dead and needs no
+	// further diagnosis.
+	if sc.Resolved && sc.Reachable {
+		sc.Ownership = classifyOwnership(ctx, sc.Addrs, name, port, timeout, sctx)
 	}
 	return sc
 }

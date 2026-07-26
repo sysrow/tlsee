@@ -758,7 +758,7 @@ func TestCheckSANsCapAndSeam(t *testing.T) {
 	}
 	// Port 1 is closed, so probes resolve (via the seam) but are unreachable;
 	// the test only asserts the cap and the seam, not reachability.
-	checks, notProbed := checkSANs(context.Background(), names, "1", 200*time.Millisecond)
+	checks, notProbed := checkSANs(context.Background(), names, "1", 200*time.Millisecond, sanContext{})
 	if len(checks) != maxSANChecks {
 		t.Errorf("probed %d names; want cap of %d", len(checks), maxSANChecks)
 	}
@@ -1057,7 +1057,7 @@ func TestCheckSANsCanceledContext(t *testing.T) {
 	for i := range names {
 		names[i] = fmt.Sprintf("name%d.invalid", i)
 	}
-	checks, notProbed := checkSANs(ctx, names, "443", time.Second)
+	checks, notProbed := checkSANs(ctx, names, "443", time.Second, sanContext{})
 
 	if got := len(checks) + notProbed; got != len(names) {
 		t.Errorf("len(checks)+notProbed = %d; want %d (every name accounted for)", got, len(names))

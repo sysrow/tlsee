@@ -43,7 +43,7 @@ func TestProbeAddr(t *testing.T) {
 // TestCheckSANWildcard verifies a wildcard name is flagged and not probed,
 // so it can be excluded from the dead-SAN count.
 func TestCheckSANWildcard(t *testing.T) {
-	sc := checkSAN(context.Background(), "*.example.com", "443", time.Second)
+	sc := checkSAN(context.Background(), "*.example.com", "443", time.Second, sanContext{})
 	if !sc.Wildcard {
 		t.Errorf("Wildcard = false; want true for %q", sc.Name)
 	}
