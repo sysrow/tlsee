@@ -105,7 +105,8 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		colorMode = fs.String("color", "auto", "color output: auto|always|never")
 		warnDays  = fs.Int("warn-days", 30, "warn when a certificate expires within this many days")
 		insecure  = fs.Bool("insecure", false, "always exit 0 even when the certificate has problems")
-		noCheck   = fs.Bool("no-check", false, "skip SAN checks (resolve, TCP-probe, and confirm each certificate name still points at the host)")
+		checkSANs = fs.Bool("check", false, "opt in to SAN checks (resolves and connects to certificate-supplied names)")
+		noCheck   = fs.Bool("no-check", false, "deprecated compatibility flag; SAN checks are disabled by default")
 		startTLS  = fs.String("starttls", "", "STARTTLS protocol to negotiate first: smtp|imap|pop3|ftp|postgres|ldap")
 		allIPs    = fs.Bool("all-ips", false, "connect to every resolved A/AAAA address and compare certificates")
 		table     = fs.Bool("table", false, "always print the summary table, even for a single target")
@@ -165,9 +166,12 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		Timeout:    *timeout,
 		ServerName: *sni,
 		ResolveDNS: true,
-		CheckSANs:  !*noCheck,
-		StartTLS:   *startTLS,
-		AllIPs:     *allIPs,
+		// SAN names are controlled by the remote certificate. Never resolve or
+		// connect to them unless the operator explicitly opts in, otherwise a
+		// malicious endpoint could use the scanner to probe internal addresses.
+		CheckSANs: sanChecksEnabled(*checkSANs, *noCheck),
+		StartTLS:  *startTLS,
+		AllIPs:    *allIPs,
 	}
 
 	// Wire the root context to interrupt signals so Ctrl-C (SIGINT) or SIGTERM
@@ -184,6 +188,12 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return scanBatch(ctx, stdout, stderr, targets, opts, *warnDays, *asJSON, useColor, *quiet, *insecure)
+}
+
+// sanChecksEnabled keeps certificate-controlled network access opt-in. The
+// legacy --no-check flag continues to override --check for compatibility.
+func sanChecksEnabled(check, noCheck bool) bool {
+	return check && !noCheck
 }
 
 // scanSingle scans one target and renders the full report. It returns the
@@ -585,7 +595,8 @@ Scan flags:
   --json              emit JSON instead of text
   --color MODE        auto|always|never (default auto)
   --warn-days N       warn when expiring within N days (default 30)
-  --no-check          skip SAN liveness checks (on by default)
+  --check             opt in to SAN liveness checks (connects to certificate-supplied names)
+  --no-check          deprecated compatibility flag; checks are off by default
   --table             always print the summary table, even for one target
   -q, --quiet         print only problems; print nothing when all healthy
   -f, --file PATH     read targets from a file (one per line; # comments ignored)
@@ -610,13 +621,14 @@ Sweep flags:
   --json              emit JSON instead of text
   --color MODE        auto|always|never (default auto)
 
-By default tlsee also resolves and TCP-probes every DNS name in the
-certificate's SAN list and reports dead or stale entries (a name that no
+With --check, tlsee resolves and TCP-probes every DNS name in the certificate's
+SAN list and reports dead or stale entries (a name that no
 longer resolves, or whose host is unreachable on the port). A name that
 resolves away from the scanned host is confirmed with one further handshake
 and reported as "elsewhere" when another certificate is served there. Dead and
 moved SANs are shown but do not change the exit code, which reflects the
-certificate's own validity. Use --no-check to skip this.
+certificate's own validity. Because these names are supplied by the remote
+certificate and may resolve to internal addresses, checks require explicit opt-in.
 
 Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon

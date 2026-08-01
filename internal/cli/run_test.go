@@ -18,6 +18,25 @@ import (
 	"github.com/sysrow/tlsee/tlsscan"
 )
 
+func TestSANChecksRequireExplicitOptIn(t *testing.T) {
+	tests := []struct {
+		name           string
+		check, noCheck bool
+		want           bool
+	}{
+		{name: "default", want: false},
+		{name: "explicit opt in", check: true, want: true},
+		{name: "legacy override", check: true, noCheck: true, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanChecksEnabled(tc.check, tc.noCheck); got != tc.want {
+				t.Fatalf("sanChecksEnabled(%t, %t) = %t; want %t", tc.check, tc.noCheck, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseHostList verifies blank lines, comment lines, and surrounding
 // whitespace are stripped while order is preserved.
 func TestParseHostList(t *testing.T) {
