@@ -613,6 +613,9 @@ func TestSweepClosedPort(t *testing.T) {
 	if res.Ports[0].TLS {
 		t.Errorf("closed port reported TLS = true")
 	}
+	if res.PortsNotProbed != 0 {
+		t.Errorf("PortsNotProbed = %d; want 0 for a completed sweep", res.PortsNotProbed)
+	}
 }
 
 // TestSweepTLSSuccess exercises the cert-reading success path: a local TLS
@@ -858,7 +861,10 @@ func TestProbePortSTARTTLS(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(addr)
 	port := mustAtoi(t, portStr)
 
-	res := probePort(context.Background(), "127.0.0.1", port, "smtp", 5*time.Second)
+	res, interrupted := probePort(context.Background(), "127.0.0.1", port, "smtp", 5*time.Second)
+	if interrupted {
+		t.Errorf("interrupted = true; want false for an uncanceled probe")
+	}
 	if !res.Open {
 		t.Errorf("Open = false; want true")
 	}
@@ -1093,9 +1099,9 @@ func TestProbeIPCertsCanceledContext(t *testing.T) {
 	}
 }
 
-// TestSweepCanceledContext verifies that ports never dispatched because the
-// context was canceled are dropped from the results instead of surfacing as
-// zero-valued entries, which would render as a bogus port 0.
+// TestSweepCanceledContext verifies that a sweep canceled before any port was
+// probed returns no verdicts at all: every requested port is counted in
+// PortsNotProbed, and no zero-valued entry (a bogus port 0) leaks into Ports.
 func TestSweepCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1108,13 +1114,57 @@ func TestSweepCanceledContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sweep error: %v", err)
 	}
-	if len(sr.Ports) > len(ports) {
-		t.Errorf("len(sr.Ports) = %d; want at most %d", len(sr.Ports), len(ports))
+	if len(sr.Ports) != 0 {
+		t.Errorf("len(sr.Ports) = %d; want 0 for a sweep canceled before it started (first: %+v)", len(sr.Ports), sr.Ports[0])
 	}
-	for i, p := range sr.Ports {
-		if p.Port < 10000 {
-			t.Fatalf("sr.Ports[%d].Port = %d; undispatched zero-valued entry leaked into the results", i, p.Port)
+	if sr.PortsNotProbed != len(ports) {
+		t.Errorf("PortsNotProbed = %d; want %d", sr.PortsNotProbed, len(ports))
+	}
+}
+
+// TestSweepInterruptedProbeNotProbed verifies that a probe cut short by
+// cancellation while in flight is dropped and counted as not probed, rather
+// than reported as a closed or non-TLS port. The listener accepts the
+// connection and then stays silent, so the probe is stuck in the handshake when
+// the context is canceled.
+func TestSweepInterruptedProbeNotProbed(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port := mustAtoi(t, portStr)
+
+	accepted := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
 		}
+		close(accepted)
+		<-release
+		conn.Close()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-accepted
+		cancel()
+	}()
+
+	sr, err := Sweep(ctx, "127.0.0.1", SweepOptions{Ports: []int{port}, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("Sweep error: %v", err)
+	}
+	if len(sr.Ports) != 0 {
+		t.Errorf("interrupted probe surfaced as a verdict: %+v", sr.Ports)
+	}
+	if sr.PortsNotProbed != 1 {
+		t.Errorf("PortsNotProbed = %d; want 1", sr.PortsNotProbed)
 	}
 }
 

@@ -354,6 +354,54 @@ func TestRunSweepJSON(t *testing.T) {
 	}
 }
 
+// TestWriteSweepResultInterrupted verifies an interrupted sweep still prints
+// the ports it did probe but reports the gap on stderr and exits with the
+// runtime-error code, so a monitor cannot mistake a partial table for a
+// complete one. A complete sweep stays silent on stderr and exits 0.
+func TestWriteSweepResultInterrupted(t *testing.T) {
+	probed := []tlsscan.PortResult{{Port: 443, Proto: "https", Open: true, TLS: true, SubjectCN: "example.com", DaysRemaining: 90}}
+	partial := &tlsscan.SweepResult{Host: "example.com", Ports: probed, PortsNotProbed: 3}
+
+	var stdout, stderr bytes.Buffer
+	if code := writeSweepResult(partial, &stdout, &stderr, false, false); code != exitError {
+		t.Errorf("interrupted sweep exit = %d; want %d", code, exitError)
+	}
+	if !strings.Contains(stdout.String(), "443") {
+		t.Errorf("interrupted sweep dropped the probed ports from the table:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "3 of 4 ports not probed") {
+		t.Errorf("stderr = %q; want the not-probed count", stderr.String())
+	}
+
+	complete := &tlsscan.SweepResult{Host: "example.com", Ports: probed}
+	stdout.Reset()
+	stderr.Reset()
+	if code := writeSweepResult(complete, &stdout, &stderr, false, false); code != exitOK {
+		t.Errorf("complete sweep exit = %d; want %d", code, exitOK)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("complete sweep wrote to stderr: %q", stderr.String())
+	}
+}
+
+// TestWriteSweepResultInterruptedJSON verifies the JSON path of an interrupted
+// sweep carries the not-probed count in the object and still exits 1.
+func TestWriteSweepResultInterruptedJSON(t *testing.T) {
+	partial := &tlsscan.SweepResult{Host: "example.com", PortsNotProbed: 2}
+
+	var stdout, stderr bytes.Buffer
+	if code := writeSweepResult(partial, &stdout, &stderr, true, false); code != exitError {
+		t.Errorf("interrupted sweep json exit = %d; want %d", code, exitError)
+	}
+	var got tlsscan.SweepResult
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("sweep JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	if got.PortsNotProbed != 2 {
+		t.Errorf("PortsNotProbed in JSON = %d; want 2", got.PortsNotProbed)
+	}
+}
+
 // TestRunSweepBadPorts verifies an invalid --ports spec is a usage error.
 func TestRunSweepBadPorts(t *testing.T) {
 	var stdout, stderr bytes.Buffer

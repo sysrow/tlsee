@@ -232,6 +232,13 @@ type PortResult struct {
 type SweepResult struct {
 	Host  string       `json:"host"`
 	Ports []PortResult `json:"ports"`
+	// PortsNotProbed counts requested ports that reached no verdict because
+	// the sweep was canceled (Ctrl-C, SIGTERM, or a caller deadline) before
+	// they were probed or while their probe was in flight. Ports holds only
+	// the ports that were fully probed, so a non-zero count marks a partial
+	// sweep. It is omitted when zero, keeping a complete sweep's JSON
+	// unchanged.
+	PortsNotProbed int `json:"portsNotProbed,omitempty"`
 }
 
 const (

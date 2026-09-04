@@ -451,14 +451,27 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
 		return exitError
 	}
+	return writeSweepResult(sr, stdout, stderr, *asJSON, useColor)
+}
 
-	if *asJSON {
+// writeSweepResult renders a sweep as a table or JSON and returns the exit
+// code. A sweep interrupted before every port was probed (Ctrl-C, SIGTERM)
+// still prints what it found, but reports the gap on stderr and exits with the
+// runtime-error code: a partial table exiting 0 would let a monitor mistake it
+// for a complete, clean sweep. Port findings themselves never affect the code.
+func writeSweepResult(sr *tlsscan.SweepResult, stdout, stderr io.Writer, asJSON, useColor bool) int {
+	if asJSON {
 		if err := report.WriteSweepJSON(stdout, sr); err != nil {
 			fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
 			return exitError
 		}
 	} else {
 		report.WriteSweepText(stdout, sr, useColor)
+	}
+	if sr.PortsNotProbed > 0 {
+		total := len(sr.Ports) + sr.PortsNotProbed
+		fmt.Fprintf(stderr, "tlsee sweep: interrupted: %d of %d ports not probed\n", sr.PortsNotProbed, total)
+		return exitError
 	}
 	return exitOK
 }
@@ -548,6 +561,7 @@ func printSweepUsage(w io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(w, "Probe many ports of one host for TLS and report each certificate.")
 	fmt.Fprintln(w, "By default a curated list of well-known TLS and STARTTLS ports is scanned.")
 	fmt.Fprintln(w, "--full scans all 65535 ports and is slow.")
+	fmt.Fprintln(w, "An interrupted sweep (Ctrl-C, SIGTERM) prints the ports probed so far and exits 1.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fs.SetOutput(w)
@@ -621,8 +635,9 @@ certificate's own validity. Use --no-check to skip this.
 Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon
      (also when help is explicitly requested)
-  1  runtime error: bad flags, missing target, unknown command, or
-     connection failure
+  1  runtime error: bad flags, missing target, unknown command,
+     connection failure, or a sweep interrupted before every port was
+     probed
   2  usage shown for no arguments, or a certificate problem: expired, not
      yet valid, untrusted, hostname mismatch, or expiring within --warn-days
      (a certificate problem is suppressed by --insecure)

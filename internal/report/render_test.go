@@ -421,6 +421,29 @@ func TestWriteSweepJSON(t *testing.T) {
 	}
 }
 
+// TestWriteSweepJSONPortsNotProbed pins the JSON contract for an interrupted
+// sweep: the count is emitted when non-zero and omitted from a complete sweep,
+// so existing consumers see an unchanged shape.
+func TestWriteSweepJSONPortsNotProbed(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteSweepJSON(&buf, sweepFixture()); err != nil {
+		t.Fatalf("WriteSweepJSON error: %v", err)
+	}
+	if strings.Contains(buf.String(), "portsNotProbed") {
+		t.Errorf("complete sweep JSON carries portsNotProbed:\n%s", buf.String())
+	}
+
+	sr := sweepFixture()
+	sr.PortsNotProbed = 2
+	buf.Reset()
+	if err := WriteSweepJSON(&buf, sr); err != nil {
+		t.Fatalf("WriteSweepJSON error: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"portsNotProbed": 2`) {
+		t.Errorf("interrupted sweep JSON missing portsNotProbed:\n%s", buf.String())
+	}
+}
+
 // TestRowIsHealthyIgnoresDeadSANs confirms quiet's health predicate matches the
 // exit-code contract: a dead SAN does not make a row unhealthy.
 func TestRowIsHealthyIgnoresDeadSANs(t *testing.T) {

@@ -113,8 +113,10 @@ main.go   ->   internal/cli        ->   tlsscan             ->   internal/report
   `exitError`. `--insecure` suppresses only certificate problems, never
   connection failures. `Report.Healthy()` is the single source of truth shared
   by the exit code, the `--quiet` row filter, and the status headline; do not
-  fork that logic. `sweep` never returns `2`: a successful run exits `0` with
-  the findings in the table, and `1` only on a usage or runtime error.
+  fork that logic. `sweep` never returns `2`: a complete run exits `0` with
+  the findings in the table, and `1` on a usage or runtime error or when the
+  sweep was interrupted before every port was probed
+  (`SweepResult.PortsNotProbed > 0`, decided in `writeSweepResult`).
 - **Dead SANs, moved SANs, and hygiene warnings are advisory only**: they appear
   in output but must never change the exit code or turn the headline red.
   `sanAdvisory` in `internal/report` is where the SAN notes are composed for the
@@ -138,7 +140,10 @@ main.go   ->   internal/cli        ->   tlsscan             ->   internal/report
   fill the remaining slots with an explicit error or truncate, but truncate
   **only after `wg.Wait()`**, since in-flight goroutines hold the slice header.
   A zero-valued row renders as a dead SAN, a bogus port 0, or panics the batch
-  path (which requires exactly one of `Report`/`Err` to be set).
+  path (which requires exactly one of `Report`/`Err` to be set). `Sweep` also
+  drops probes cut short in flight (`probePort` flags them via its second
+  result) and counts both kinds in `PortsNotProbed`: a canceled dial fails
+  exactly like a refused one, so it must never be reported as a closed port.
 - **Weak TLS versions and insecure cipher suites are enabled on purpose** in
   `tlsHandshake` (`MinVersion: tls.VersionTLS10`, all suite IDs). Go's secure
   defaults would make the weak-version/weak-cipher hygiene warnings unreachable.

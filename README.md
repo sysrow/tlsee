@@ -166,6 +166,9 @@ POP3, LDAP, FTP, and PostgreSQL).
 | `--json`    | `false` | Emit JSON instead of text.                                      |
 | `--color`   | `auto`  | Color output: `auto`, `always`, or `never`.                     |
 
+Interrupting a sweep (Ctrl-C, SIGTERM) prints the ports probed so far, reports
+the number left unprobed on stderr, and exits `1`; see [Exit codes](#exit-codes).
+
 ## SAN liveness
 
 For each DNS name in the certificate's SAN list, `tlsee` reports one of:
@@ -208,7 +211,7 @@ are advisory only: they do **not** change the exit code or the status headline.
 | Code | Meaning                                                                  |
 | ---- | ------------------------------------------------------------------------ |
 | `0`  | Healthy: trusted chain, hostname matches, valid, and not expiring soon. Also when help is explicitly requested (`help`, `-h`, `--help`), which is written to stdout. |
-| `1`  | Runtime error: bad flags, missing target, unknown command, or connection failure. |
+| `1`  | Runtime error: bad flags, missing target, unknown command, connection failure, or a sweep interrupted before every port was probed. |
 | `2`  | Usage shown for no arguments, or a certificate problem: expired, not yet valid, untrusted, hostname mismatch, or expiring within `--warn-days`. A certificate problem is suppressed by `--insecure`. |
 
 With `--insecure`, the certificate is still retrieved and printed; only the
@@ -216,5 +219,8 @@ exit code is forced to `0`.
 
 In batch mode the exit code is the worst per-host code: `2` if any certificate
 has a problem, `1` if any host failed to scan, otherwise `0`. The `sweep`
-subcommand always exits `0` on a successful run (port findings are reported in
-the table, not the exit code) and `1` only on a usage or runtime error.
+subcommand exits `0` on a complete run (port findings are reported in the
+table, not the exit code) and `1` on a usage or runtime error, including a
+sweep interrupted by Ctrl-C or SIGTERM before every port was probed: the ports
+probed so far are still printed, stderr reports how many were skipped, and the
+JSON object carries `portsNotProbed`.

@@ -66,9 +66,12 @@ func DefaultSweepPorts() []int {
 }
 
 // Sweep probes each requested port of host concurrently and returns one result
-// per port, sorted ascending by port. Per-port failures are captured in the
-// PortResult rather than returned as an error; an error is returned only for an
-// invalid host or an empty port list.
+// per fully probed port, sorted ascending by port. Per-port failures are
+// captured in the PortResult rather than returned as an error; an error is
+// returned only for an invalid host or an empty port list. When ctx is
+// canceled mid-sweep the ports probed so far are returned and the rest are
+// counted in PortsNotProbed, so the caller can tell a partial sweep from a
+// complete one.
 func Sweep(ctx context.Context, host string, opts SweepOptions) (*SweepResult, error) {
 	if strings.TrimSpace(host) == "" {
 		return nil, fmt.Errorf("sweep: empty host")
@@ -90,36 +93,46 @@ func Sweep(ctx context.Context, host string, opts SweepOptions) (*SweepResult, e
 	}
 
 	results := make([]PortResult, len(ports))
+	interrupted := make([]bool, len(ports))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	dispatched := len(ports)
+dispatch:
 	for i, port := range ports {
 		// Stop dispatching promptly on cancellation (Ctrl-C/SIGTERM) rather than
 		// launching a probe for every remaining port (important for --full).
-		// Ports never dispatched are dropped from the results: a zero-valued
-		// entry would render as a bogus port 0.
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			// Truncate only after the in-flight probes finish: the spawned
-			// goroutines read the results slice header through their closure, so
-			// reassigning it before Wait would race with them.
-			wg.Wait()
-			results = results[:i]
-			sort.Slice(results, func(a, b int) bool { return results[a].Port < results[b].Port })
-			return &SweepResult{Host: host, Ports: results}, nil
+			dispatched = i
+			break dispatch
 		}
 		wg.Add(1)
 		go func(i, port int) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			proto := curatedPorts[port].StartTLS
-			results[i] = probePort(ctx, host, port, proto, timeout)
+			results[i], interrupted[i] = probePort(ctx, host, port, proto, timeout)
 		}(i, port)
 	}
 	wg.Wait()
 
-	sort.Slice(results, func(a, b int) bool { return results[a].Port < results[b].Port })
-	return &SweepResult{Host: host, Ports: results}, nil
+	// Keep only the ports that reached a verdict. A port never dispatched would
+	// surface as a zero-valued entry (a bogus port 0), and a probe cut short by
+	// cancellation would masquerade as a closed or non-TLS port; both are
+	// counted as not probed instead so a partial sweep is visible as such. The
+	// filter runs only after Wait, since in-flight goroutines still write
+	// through the results slice.
+	probed := results[:0]
+	for i := 0; i < dispatched; i++ {
+		if interrupted[i] {
+			continue
+		}
+		probed = append(probed, results[i])
+	}
+
+	sort.Slice(probed, func(a, b int) bool { return probed[a].Port < probed[b].Port })
+	return &SweepResult{Host: host, Ports: probed, PortsNotProbed: len(ports) - len(probed)}, nil
 }
 
 // probePort probes a single port of host using the same dial, STARTTLS, and
@@ -128,7 +141,13 @@ func Sweep(ctx context.Context, host string, opts SweepOptions) (*SweepResult, e
 // certificate summary. Failures are recorded in PortResult.Error; a port that
 // is open but never completes a TLS handshake is reported with TLS=false and
 // Error "no TLS".
-func probePort(ctx context.Context, host string, port int, proto string, timeout time.Duration) PortResult {
+//
+// The second result is true when ctx was canceled before the probe reached a
+// verdict. A canceled dial or handshake fails exactly like a refused or
+// non-TLS port would, so the PortResult then describes the cancellation, not
+// the port, and the caller must not report it. A per-port timeout is a
+// verdict (the port did not answer in time), not an interruption.
+func probePort(ctx context.Context, host string, port int, proto string, timeout time.Duration) (PortResult, bool) {
 	res := PortResult{Port: port, Proto: displayProto(port, proto)}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
@@ -141,7 +160,7 @@ func probePort(ctx context.Context, host string, port int, proto string, timeout
 	conn, err := dialPlaintext(portCtx, addr, timeout)
 	if err != nil {
 		// Closed or unreachable: Open stays false. The error is informational.
-		return res
+		return res, ctx.Err() != nil
 	}
 	defer conn.Close()
 	res.Open = true
@@ -149,20 +168,20 @@ func probePort(ctx context.Context, host string, port int, proto string, timeout
 	if proto != "" {
 		if err := startTLSNegotiate(portCtx, conn, proto, timeout); err != nil {
 			res.Error = "no TLS"
-			return res
+			return res, ctx.Err() != nil
 		}
 	}
 
 	tlsConn, err := tlsHandshake(portCtx, conn, host, timeout)
 	if err != nil {
 		res.Error = "no TLS"
-		return res
+		return res, ctx.Err() != nil
 	}
 
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		res.Error = "no TLS"
-		return res
+		return res, false
 	}
 
 	res.TLS = true
@@ -174,7 +193,7 @@ func probePort(ctx context.Context, host string, port int, proto string, timeout
 	res.DaysRemaining = info.DaysRemaining
 	res.Expired = info.Expired
 	res.NotYetValid = info.NotYetValid
-	return res
+	return res, false
 }
 
 // displayProto returns the PROTO column value for a port. Ports in the curated
