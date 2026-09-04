@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented in full. All five tasks are committed (72e4163 through 9d11159) and released in v0.3.0.
+
 **Goal:** Report SAN names on a certificate that no longer resolve to the host being scanned, so an operator can see which names on a certificate are stale before renewing it.
 
-**Architecture:** Two stages inside the existing SAN liveness check. First, compare the name's resolved addresses against the scanned host's own addresses — free, using data the scan already collected. Only when the two sets are disjoint, open one confirming TLS handshake to the name (SNI set to that name) and compare leaf fingerprints, which separates a CDN serving our certificate from a host that has taken the name over. The finding is advisory: it changes output only, never the exit code.
+**Architecture:** Two stages inside the existing SAN liveness check. First, compare the name's resolved addresses against the scanned host's own addresses, which is free because it uses data the scan already collected. Only when the two sets are disjoint, open one confirming TLS handshake to the name (SNI set to that name) and compare leaf fingerprints, which separates a CDN serving our certificate from a host that has taken the name over. The finding is advisory: it changes output only, never the exit code.
 
 **Tech Stack:** Go 1.25 standard library only. `net/netip` for address comparison, `crypto/x509` for generating a second test certificate, existing `probeIPCert` for the confirming handshake.
 
@@ -43,7 +45,7 @@
 - Consumes: nothing from earlier tasks.
 - Produces: `SANOwnership` string type with constants `OwnershipUnknown`, `OwnershipSameHost`, `OwnershipSameCert`, `OwnershipOtherCert`, `OwnershipUnverified`; field `SANCheck.Ownership SANOwnership`; field `Report.SANsElsewhere int`; `hostAddrSet(host string, resolved []string) map[netip.Addr]bool`; `classifyAddrs(addrs []AddrCheck, hostAddrs map[netip.Addr]bool) (sameHost bool, probeIP string)`; `countSANFindings(checks []SANCheck) (dead, elsewhere int)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `tlsscan/core_test.go`. Add `"net/netip"` to that file's import block.
 
@@ -149,12 +151,12 @@ func TestCountSANFindings(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -run 'TestHostAddrSet|TestClassifyAddrs|TestCountSANFindings' ./tlsscan/`
-Expected: FAIL to compile — `undefined: hostAddrSet`, `undefined: classifyAddrs`, `undefined: countSANFindings`, `undefined: OwnershipSameHost`.
+Expected: FAIL to compile with `undefined: hostAddrSet`, `undefined: classifyAddrs`, `undefined: countSANFindings`, `undefined: OwnershipSameHost`.
 
-- [ ] **Step 3: Add the type and the `SANCheck` field**
+- [x] **Step 3: Add the type and the `SANCheck` field**
 
 In `tlsscan/tlsscan.go`, add `"net/netip"` to the import block. Immediately above the `SANCheck` type (line 104), add:
 
@@ -191,7 +193,7 @@ Then add the field to `SANCheck`, after `Reachable`:
 	Ownership SANOwnership `json:"ownership,omitempty"`
 ```
 
-- [ ] **Step 4: Add the `Report` counter**
+- [x] **Step 4: Add the `Report` counter**
 
 In `tlsscan/tlsscan.go`, directly after the `DeadSANs` field on `Report`:
 
@@ -204,7 +206,7 @@ In `tlsscan/tlsscan.go`, directly after the `DeadSANs` field on `Report`:
 	SANsElsewhere int `json:"sansElsewhere"`
 ```
 
-- [ ] **Step 5: Implement the three helpers**
+- [x] **Step 5: Implement the three helpers**
 
 Add to `tlsscan/tlsscan.go`, after `checkSAN` (which ends at line 484):
 
@@ -273,17 +275,17 @@ func countSANFindings(checks []SANCheck) (dead, elsewhere int) {
 }
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `go test -race -run 'TestHostAddrSet|TestClassifyAddrs|TestCountSANFindings' ./tlsscan/ -v`
 Expected: PASS, all three tests.
 
-- [ ] **Step 7: Verify nothing else broke**
+- [x] **Step 7: Verify nothing else broke**
 
 Run: `gofmt -l . && go vet ./... && go test -race -count=1 ./...`
 Expected: no gofmt output, no vet output, all tests PASS. The existing `DeadSANs` counting loop in `Scan` is untouched at this point, so behavior is unchanged.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add tlsscan/tlsscan.go tlsscan/core_test.go
@@ -306,11 +308,11 @@ counters. Not wired into Scan yet, so behavior is unchanged."
 - Consumes: `SANOwnership` constants, `hostAddrSet`, `classifyAddrs`, `countSANFindings` from Task 1; existing `probeIPCert(ctx context.Context, ip, port, sni, proto string, timeout time.Duration) IPCert` at `tlsscan/tlsscan.go:561`.
 - Produces: `sanContext` struct; `classifyOwnership(ctx context.Context, addrs []AddrCheck, name, port string, timeout time.Duration, sctx sanContext) SANOwnership`; changed signatures `checkSANs(ctx, names, port, timeout, sctx)` and `checkSAN(ctx, name, port, timeout, sctx)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `tlsscan/core_test.go`. Add these imports to that file if absent: `"crypto/ecdsa"`, `"crypto/elliptic"`, `"crypto/rand"`, `"crypto/x509"`, `"crypto/x509/pkix"`, `"math/big"`.
 
-These tests call `classifyOwnership` directly rather than going through `Scan`, because SAN liveness probes always use the scanned port — calling the helper lets each case point at a listener on its own port without loopback aliases.
+These tests call `classifyOwnership` directly rather than going through `Scan`, because SAN liveness probes always use the scanned port; calling the helper lets each case point at a listener on its own port without loopback aliases.
 
 ```go
 // newSelfSignedCert generates a throwaway self-signed certificate so a test can
@@ -471,12 +473,12 @@ func TestClassifyOwnershipUnverifiedWhenHandshakeFails(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -run TestClassifyOwnership ./tlsscan/`
-Expected: FAIL to compile — `undefined: sanContext`, `undefined: classifyOwnership`.
+Expected: FAIL to compile with `undefined: sanContext`, `undefined: classifyOwnership`.
 
-- [ ] **Step 3: Add `sanContext` and `classifyOwnership`**
+- [x] **Step 3: Add `sanContext` and `classifyOwnership`**
 
 In `tlsscan/tlsscan.go`, add after the helpers from Task 1:
 
@@ -527,12 +529,12 @@ func classifyOwnership(ctx context.Context, addrs []AddrCheck, name, port string
 }
 ```
 
-- [ ] **Step 4: Run the new tests to verify they pass**
+- [x] **Step 4: Run the new tests to verify they pass**
 
 Run: `go test -race -run TestClassifyOwnership ./tlsscan/ -v`
 Expected: PASS, all five tests. The rest of the suite still compiles because `checkSAN` has not changed yet.
 
-- [ ] **Step 5: Commit the classification core**
+- [x] **Step 5: Commit the classification core**
 
 ```bash
 git add tlsscan/tlsscan.go tlsscan/core_test.go
@@ -543,11 +545,11 @@ scanned host's and, only when they are disjoint, opens one handshake to compare
 leaf fingerprints. Not yet called from checkSAN."
 ```
 
-- [ ] **Step 6: Thread `sanContext` through `checkSANs` and `checkSAN`**
+- [x] **Step 6: Thread `sanContext` through `checkSANs` and `checkSAN`**
 
 In `tlsscan/tlsscan.go`, change the two signatures and the call between them.
 
-`checkSANs` (line 420) — signature and the goroutine body:
+`checkSANs` (line 420), signature and the goroutine body:
 
 ```go
 func checkSANs(ctx context.Context, names []string, port string, timeout time.Duration, sctx sanContext) (checks []SANCheck, notProbed int) {
@@ -559,7 +561,7 @@ and inside its goroutine, replace the `checkSAN` call with:
 			checks[i] = checkSAN(ctx, name, port, timeout, sctx)
 ```
 
-`checkSAN` (line 457) — signature, and the classification at the end. Replace the closing `return sc` with the ownership step:
+`checkSAN` (line 457), signature and the classification at the end. Replace the closing `return sc` with the ownership step:
 
 ```go
 func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sctx sanContext) SANCheck {
@@ -576,7 +578,7 @@ func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sct
 }
 ```
 
-- [ ] **Step 7: Wire it into `Scan`**
+- [x] **Step 7: Wire it into `Scan`**
 
 In `tlsscan/tlsscan.go`, replace the SAN block at lines 344-351 with:
 
@@ -592,7 +594,7 @@ In `tlsscan/tlsscan.go`, replace the SAN block at lines 344-351 with:
 	}
 ```
 
-- [ ] **Step 8: Fix the remaining `checkSANs` callers in tests**
+- [x] **Step 8: Fix the remaining `checkSANs` callers in tests**
 
 Run: `go build ./... && go vet ./...`
 Expected: compile errors in `tlsscan/core_test.go` at the existing `checkSANs` calls in `TestCheckSANsCapAndSeam` and `TestCheckSANsCanceledContext`.
@@ -609,12 +611,12 @@ Add `sanContext{}` as the final argument to both:
 
 An empty `sanContext` means no host addresses are known, so those tests keep classification switched off and continue to assert only what they asserted before.
 
-- [ ] **Step 9: Run the full suite**
+- [x] **Step 9: Run the full suite**
 
 Run: `gofmt -l . && go vet ./... && go test -race -count=1 ./...`
 Expected: no gofmt output, no vet output, all tests PASS.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add tlsscan/tlsscan.go tlsscan/core_test.go
@@ -637,7 +639,7 @@ same-cert, other-cert, or unverified. Advisory only: exit codes are unchanged."
 - Consumes: `tlsscan.SANOwnership` constants and `tlsscan.SANCheck.Ownership` from Tasks 1-2.
 - Produces: `colorMagenta` constant; `sanLiveness` returning the new state strings.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `internal/report/render_test.go`:
 
@@ -717,12 +719,12 @@ func TestSANLivenessMagentaSuppressedWithoutColor(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `go test -run 'TestSANLiveness' ./internal/report/`
-Expected: FAIL to compile — `undefined: colorMagenta`.
+Expected: FAIL to compile with `undefined: colorMagenta`.
 
-- [ ] **Step 3: Add the palette entry**
+- [x] **Step 3: Add the palette entry**
 
 In `internal/report/report.go`, in the color block at lines 22-28, add after `colorYellow`:
 
@@ -734,7 +736,7 @@ In `internal/report/report.go`, in the color block at lines 22-28, add after `co
 	colorMagenta = "\033[35m"
 ```
 
-- [ ] **Step 4: Rewrite `sanLiveness`**
+- [x] **Step 4: Rewrite `sanLiveness`**
 
 Replace the whole function at `internal/report/report.go:584` with:
 
@@ -791,24 +793,24 @@ func sanLiveness(c tlsscan.SANCheck) (addrs, state, color string) {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `go test -race -run 'TestSANLiveness' ./internal/report/ -v`
 Expected: PASS, both tests.
 
 Note while you are in this file: in the SAN liveness block of `WriteText`
 (line 229-238) the state cell is colored *before* it reaches the tabwriter,
-which is safe only because it is the last column — tabwriter measures byte
+which is safe only because it is the last column; tabwriter measures byte
 width, so an ANSI-colored cell with anything after it would misalign. Do not add
 a column after the state cell. If one is ever needed, adopt the batch-table
 pattern instead: lay the table out monochrome into a buffer, then colorize.
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `gofmt -l . && go vet ./... && go test -race -count=1 ./...`
 Expected: no output from gofmt or vet, all tests PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add internal/report/report.go internal/report/render_test.go
@@ -830,7 +832,7 @@ scanned host, and reports ownership in place of open/partial for those names."
 - Consumes: `tlsscan.Report.SANsElsewhere` from Task 1.
 - Produces: `elsewhereSANStatus(n int) string`; `sanAdvisory(r *tlsscan.Report) string`; `batchStatus.note` field replacing `batchStatus.dead`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `internal/report/report_test.go`:
 
@@ -914,12 +916,12 @@ func TestBatchNoteReportsMovedSANs(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -run 'TestSummarize|TestBatchNote' ./internal/report/`
-Expected: FAIL — the headline lacks the elsewhere advisory and the batch note lacks `2 elsewhere`.
+Expected: FAIL because the headline lacks the elsewhere advisory and the batch note lacks `2 elsewhere`.
 
-- [ ] **Step 3: Add the advisory helpers**
+- [x] **Step 3: Add the advisory helpers**
 
 In `internal/report/report.go`, after `deadSANStatus` (line 94-99), add:
 
@@ -950,7 +952,7 @@ func sanAdvisory(r *tlsscan.Report) string {
 }
 ```
 
-- [ ] **Step 4: Use them in `summarize`**
+- [x] **Step 4: Use them in `summarize`**
 
 In `internal/report/report.go`, replace the two advisory blocks at the end of `summarize` (lines 76-90) with:
 
@@ -987,7 +989,7 @@ Also update the doc comment above `summarize` (lines 42-50): replace the sentenc
 // escalating the color.
 ```
 
-- [ ] **Step 5: Rename `batchStatus.dead` to `note` and include moved names**
+- [x] **Step 5: Rename `batchStatus.dead` to `note` and include moved names**
 
 In `internal/report/report.go`, change the `batchStatus` struct (lines 334-339):
 
@@ -1027,17 +1029,17 @@ In `WriteBatchTable` (line 424), change:
 		note := bs.note
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `go test -race -run 'TestSummarize|TestBatchNote' ./internal/report/ -v`
 Expected: PASS, all four tests.
 
-- [ ] **Step 7: Run the full suite**
+- [x] **Step 7: Run the full suite**
 
 Run: `gofmt -l . && go vet ./... && go test -race -count=1 ./...`
 Expected: no output from gofmt or vet, all tests PASS. If an existing batch render test asserted the exact `NOTE` cell, it still passes: a report with no moved SANs renders the bare count exactly as before.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add internal/report/report.go internal/report/report_test.go internal/report/render_test.go
@@ -1061,7 +1063,7 @@ advisory: neither escalates the headline color nor the exit code."
 - Consumes: the state names and behavior established in Tasks 1-4.
 - Produces: no code.
 
-- [ ] **Step 1: Update the README state table**
+- [x] **Step 1: Update the README state table**
 
 In `README.md`, replace the SAN liveness state table with:
 
@@ -1078,7 +1080,7 @@ In `README.md`, replace the SAN liveness state table with:
 | `wildcard (not probed)`      | A `*.` name, which cannot be resolved directly.               |
 ```
 
-- [ ] **Step 2: Add a README paragraph on moved names**
+- [x] **Step 2: Add a README paragraph on moved names**
 
 In `README.md`, immediately after that table, before the existing "Names that are `unreachable`..." paragraph, insert:
 
@@ -1093,7 +1095,7 @@ are advisory and do **not** change the exit code. The comparison costs no extra
 connection for names that still point at the scanned host.
 ```
 
-- [ ] **Step 3: Update `writeUsage`**
+- [x] **Step 3: Update `writeUsage`**
 
 In `internal/cli/cli.go`, replace the SAN paragraph in the `writeUsage` raw string (lines 613-617) with:
 
@@ -1107,7 +1109,7 @@ moved SANs are shown but do not change the exit code, which reflects the
 certificate's own validity. Use --no-check to skip this.
 ```
 
-- [ ] **Step 4: Update the `--no-check` flag description**
+- [x] **Step 4: Update the `--no-check` flag description**
 
 In `internal/cli/cli.go` at line 108, the flag's help text still describes only
 the liveness half of the check. Replace it with:
@@ -1116,7 +1118,7 @@ the liveness half of the check. Replace it with:
 		noCheck   = fs.Bool("no-check", false, "skip SAN checks (resolve, TCP-probe, and confirm each certificate name still points at the host)")
 ```
 
-- [ ] **Step 5: Update the CLAUDE.md invariants**
+- [x] **Step 5: Update the CLAUDE.md invariants**
 
 In `CLAUDE.md`, replace the "Dead SANs and hygiene warnings are advisory only" bullet with:
 
@@ -1131,20 +1133,20 @@ In `CLAUDE.md`, replace the "Dead SANs and hygiene warnings are advisory only" b
 - **SAN ownership classification is free unless something looks wrong**: address
   sets are compared from data the scan already has, and a confirming handshake
   runs only for a name whose addresses are disjoint from the host's. Keep that
-  ordering — reversing it puts a handshake on every name of every certificate.
+  ordering: reversing it puts a handshake on every name of every certificate.
 ```
 
-- [ ] **Step 6: Verify docs match behavior**
+- [x] **Step 6: Verify docs match behavior**
 
 Run: `mkdir -p ~/scratch/go && go build -o ~/scratch/go/tlsee . && ~/scratch/go/tlsee help`
 Expected: the help text shows the updated SAN paragraph. Read it and confirm it matches what Task 3 actually renders.
 
-- [ ] **Step 7: Run the full suite one last time**
+- [x] **Step 7: Run the full suite one last time**
 
 Run: `gofmt -l . && go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@latest ./... && go test -race -count=1 ./...`
 Expected: no output from gofmt, vet, or staticcheck; all tests PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add README.md internal/cli/cli.go CLAUDE.md

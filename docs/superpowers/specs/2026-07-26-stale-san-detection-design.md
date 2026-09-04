@@ -1,7 +1,7 @@
 # Stale SAN detection: names that no longer point at the scanned host
 
 Date: 2026-07-26
-Status: approved, not yet implemented
+Status: implemented and released in v0.3.0 (commits 72e4163 through 9d11159)
 
 ## Problem
 
@@ -40,7 +40,7 @@ Hybrid, in two stages, so the common case costs nothing:
 1. **Address comparison (free).** The scan already knows the host's own
    addresses (`Report.ResolvedIPs`) and each SAN name's addresses (collected by
    the liveness probe). A non-empty intersection means the name still points at
-   the scanned host. Done — no network call.
+   the scanned host. Done; no network call.
 2. **Certificate confirmation (only when addresses disagree).** For a name whose
    addresses are disjoint from the host's, open one TLS handshake to its first
    reachable address with SNI set to that name, and compare the leaf SHA-256
@@ -118,7 +118,7 @@ target the literal itself is the set. An empty set yields `OwnershipUnknown` for
 every name.
 
 The confirming handshake reuses the existing `probeIPCert` unchanged
-(`tlsscan/tlsscan.go:561`) — it already retrieves a leaf fingerprint from a
+(`tlsscan/tlsscan.go:561`); it already retrieves a leaf fingerprint from a
 given address with a given SNI, and already handles STARTTLS, so `--starttls`
 targets work without extra code. SNI is set to the SAN name, not the scanned
 host, because the question is what that name is served by.
@@ -140,7 +140,7 @@ type sanContext struct {
 In `Scan`, `checkSANs` is already called after DNS resolution populates
 `ResolvedIPs`, so no reordering is needed. The confirming handshakes run inside
 the existing bounded SAN probe pool (`sanProbeConcurrency`) and under the
-existing per-probe timeout, on the caller's `ctx` — not on the depleted
+existing per-probe timeout, on the caller's `ctx`, not on the depleted
 `scanCtx`.
 
 ## Rendering
@@ -166,7 +166,7 @@ visually distinct from both a healthy name (green) and a dead or degraded one
 
 The ownership state replaces `open` / `partial` rather than being appended: a
 name having moved matters more than one of its addresses being down, and the
-per-address detail is not lost — the address column still marks the specific
+per-address detail is not lost; the address column still marks the specific
 address `(down)`.
 
 The status headline gains `| N SANS ELSEWHERE` alongside the existing

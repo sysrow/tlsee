@@ -22,8 +22,10 @@ separate facts. It works against public hosts and internal targets alike
 By default it also performs a **SAN liveness check**: every DNS name in the
 certificate's SAN list is resolved (A/AAAA) and TCP-probed on the scanned port,
 so dead or stale entries are surfaced -- a name that no longer resolves, or
-whose host is unreachable. This catches names left on a certificate after the
-service behind them was decommissioned.
+whose host is unreachable. Each reachable name is also checked to still point
+at the scanned host (see [SAN liveness](#san-liveness)). This catches names
+left on a certificate after the service behind them was decommissioned or
+moved elsewhere.
 
 Built with the Go standard library only. No third-party dependencies.
 
@@ -37,8 +39,8 @@ go install github.com/sysrow/tlsee@latest
 go build -o tlsee .
 ```
 
-Prebuilt binaries for Linux, macOS, and Windows (amd64/arm64) are attached to
-each [GitHub release](https://github.com/sysrow/tlsee/releases).
+Prebuilt binaries for Linux and macOS (amd64, arm64) and Windows (amd64) are
+attached to each [GitHub release](https://github.com/sysrow/tlsee/releases).
 
 ## Usage
 
@@ -92,7 +94,7 @@ tlsee version
 | `--json`      | `false` | Emit JSON instead of text (a single report, or an array in batch mode). |
 | `--color`     | `auto`  | Color output: `auto`, `always`, or `never`.                  |
 | `--warn-days` | `30`    | Warn when the certificate expires within this many days.     |
-| `--no-check`  | `false` | Skip the SAN liveness check (resolve + TCP-probe of each name).|
+| `--no-check`  | `false` | Skip the SAN checks (resolve, TCP-probe, and confirm each name still points at the host). |
 | `--table`     | `false` | Always print the summary table, even for a single target.    |
 | `-q`, `--quiet` | `false` | Print only problems; print nothing when everything is healthy. |
 | `-f`, `--file`  | (none)  | Read targets from a file (one per line; `#` comments and blank lines ignored). |
