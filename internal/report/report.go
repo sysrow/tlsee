@@ -491,8 +491,8 @@ func writeBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	// failed row, instead of putting an error message under a "dead SAN count"
 	// header.
 	//
-	// Column layout is computed on the uncolored cells: tabwriter measures byte
-	// width, so a colored STATUS cell would make it count the invisible ANSI
+	// Column layout is computed on the uncolored cells: tabwriter counts
+	// code points, so a colored STATUS cell would make it count the invisible ANSI
 	// escape bytes and push the NOTE header out of alignment. The table is laid
 	// out monochrome into a buffer first, then the STATUS word on each data line
 	// is wrapped in color afterwards (color codes have zero visible width, so the
@@ -518,43 +518,37 @@ func writeBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	}
 
 	// Colorize the laid-out table line by line. The header is line 0; each
-	// subsequent line maps in order to statuses[i]. Only the first run of the
-	// already-padded status word is recolored, so a status token appearing inside
-	// a host or note cell is never touched.
+	// subsequent line maps in order to statuses[i]. The ASCII header identifies
+	// the status column; matching by position avoids coloring a hostname or note
+	// that happens to contain the same word.
 	lines := strings.SplitAfter(plain.String(), "\n")
+	statusColumn := strings.Index(lines[0], "STATUS")
 	for i, line := range lines {
 		if i == 0 || i-1 >= len(statuses) || line == "" {
 			io.WriteString(w, line)
 			continue
 		}
 		bs := statuses[i-1]
-		io.WriteString(w, colorizeStatusCell(line, bs.status, bs.color))
+		io.WriteString(w, colorizeStatusCell(line, statusColumn, bs.status, bs.color))
 	}
 }
 
-// colorizeStatusCell wraps the first occurrence of the padded status word in
-// line with the given color. The word is matched as a whole, space-delimited
-// token (the only place a bare status word stands alone in a laid-out row) so a
-// coincidental substring in the host or note column is left untouched. Because
-// the surrounding spaces and the word's visible width are unchanged, the column
-// alignment computed by tabwriter is preserved.
-func colorizeStatusCell(line, word, color string) string {
+// colorizeStatusCell colors the known status column in a laid-out row. Columns
+// are measured in code points, as in tabwriter, so a multibyte hostname does
+// not shift the color onto a neighboring cell. Padding remains unchanged.
+func colorizeStatusCell(line string, column int, word, color string) string {
 	if word == "" || color == "" {
 		return line
 	}
-	idx := strings.Index(line, word)
-	for idx >= 0 {
-		before := idx == 0 || line[idx-1] == ' '
-		end := idx + len(word)
-		after := end >= len(line) || line[end] == ' ' || line[end] == '\n'
-		if before && after {
-			return line[:idx] + color + word + colorReset + line[end:]
+	for offset := range line {
+		if column == 0 {
+			if !strings.HasPrefix(line[offset:], word) {
+				return line
+			}
+			end := offset + len(word)
+			return line[:offset] + color + word + colorReset + line[end:]
 		}
-		next := strings.Index(line[idx+1:], word)
-		if next < 0 {
-			break
-		}
-		idx = idx + 1 + next
+		column--
 	}
 	return line
 }
