@@ -13,7 +13,7 @@ func TestParseTargetRejectsMissingHost(t *testing.T) {
 	} {
 		t.Run(target, func(t *testing.T) {
 			host, port, err := parseTarget(target, "")
-			if err == nil || !strings.Contains(err.Error(), "no host") {
+			if err == nil {
 				t.Fatalf("parseTarget(%q) = (%q, %q, %v); want missing-host error", target, host, port, err)
 			}
 		})

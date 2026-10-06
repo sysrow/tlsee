@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -357,9 +358,10 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 		report.ChainTrusted = true
 	}
 
-	// Hostname matching is independent of trust. VerifyHostname also
-	// handles IP SANs, so the parsed host is passed directly.
-	report.HostnameMatch = leaf.VerifyHostname(host) == nil
+	// Hostname matching is independent of trust. An IPv6 zone selects a local
+	// network interface; it is not part of the certificate's IP identity.
+	identity, isIP := hostIdentity(host)
+	report.HostnameMatch = leaf.VerifyHostname(identity) == nil
 
 	// DNS resolution is best-effort and skipped for IP literals. It is
 	// bounded by its own timeout-derived context so a slow resolver cannot
@@ -370,7 +372,7 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 	// enrichment little or no time and, worse, make checkSANs/probeIPCerts trip
 	// their cancellation path and report un-probed names as dead. These steps
 	// carry their own per-probe timeouts and still honor ctx cancellation.
-	if opts.ResolveDNS && net.ParseIP(host) == nil {
+	if opts.ResolveDNS && !isIP {
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, timeout)
 		defer lookupCancel()
 		if ips, lookupErr := net.DefaultResolver.LookupHost(lookupCtx, host); lookupErr == nil {
@@ -407,7 +409,7 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 	// Per-IP certificates: connect to every resolved address (SNI=host) to
 	// detect backends serving a stale or mismatched certificate. Skipped for IP
 	// literals; only meaningful when more than one address resolves.
-	if opts.AllIPs && net.ParseIP(host) == nil {
+	if opts.AllIPs && !isIP {
 		report.IPCerts, report.IPCertsDiffer = probeIPCerts(ctx, host, port, sni, opts.StartTLS, report.ResolvedIPs, probeTimeout(timeout))
 	}
 
@@ -806,8 +808,19 @@ func ipCertsDiffer(certs []IPCert) bool {
 	return false
 }
 
+// hostIdentity returns the name or IP identity to verify against a certificate.
+// IPv6 zones are routing information and must not become part of an IP SAN
+// comparison. The second result also identifies zoned literals as IP addresses
+// so the caller does not attempt DNS enrichment for them.
+func hostIdentity(host string) (string, bool) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.WithZone("").String(), true
+	}
+	return host, false
+}
+
 // parseTarget splits a target into host and port. It strips a leading
-// scheme and any trailing path or query, then splits the host and port.
+// scheme and any trailing path, query, or fragment, then splits the host and port.
 // When no port is present, defaultPortOverride (or 443) is used. IPv6
 // literals such as "[::1]:8443" and "[::1]" are handled.
 func parseTarget(target, defaultPortOverride string) (host, port string, err error) {
@@ -824,23 +837,27 @@ func parseTarget(target, defaultPortOverride string) (host, port string, err err
 		return "", "", fmt.Errorf("parse target: empty target")
 	}
 
-	// Strip a leading scheme such as "https://" or "tls://".
-	if i := strings.Index(remainder, "://"); i >= 0 {
-		remainder = remainder[i+len("://"):]
-	}
-
-	// Strip any trailing path or query. For an IPv6 literal the host is
-	// inside brackets, so only look past the closing bracket.
-	cut := remainder
-	if strings.HasPrefix(remainder, "[") {
-		if end := strings.IndexByte(remainder, ']'); end >= 0 {
-			cut = remainder[end:]
-			if slash := strings.IndexAny(cut, "/?"); slash >= 0 {
-				remainder = remainder[:end] + cut[:slash]
+	// Use URL authority parsing for a leading scheme: userinfo is not part of
+	// the dial host, and IPv6 URL zones need percent decoding. A scheme inside
+	// a bare target's path, query, or fragment must not replace its host.
+	if i := strings.Index(remainder, "://"); i >= 0 && !strings.ContainsAny(remainder[:i], "/?#") {
+		parsed, parseErr := url.Parse(remainder)
+		if parseErr != nil {
+			return "", "", fmt.Errorf("parse target %q: %w", target, parseErr)
+		}
+		remainder = parsed.Host
+	} else {
+		// Brackets delimit an IPv6 literal, whose routing zone can contain
+		// characters that would otherwise begin a URL suffix.
+		suffixStart := 0
+		if strings.HasPrefix(remainder, "[") {
+			if end := strings.IndexByte(remainder, ']'); end >= 0 {
+				suffixStart = end + 1
 			}
 		}
-	} else if slash := strings.IndexAny(remainder, "/?"); slash >= 0 {
-		remainder = remainder[:slash]
+		if end := strings.IndexAny(remainder[suffixStart:], "/?#"); end >= 0 {
+			remainder = remainder[:suffixStart+end]
+		}
 	}
 
 	if remainder == "" {
@@ -854,7 +871,8 @@ func parseTarget(target, defaultPortOverride string) (host, port string, err err
 		// like "::1" or "2001:db8::1", for which SplitHostPort instead reports
 		// "too many colons in address".
 		bare := strings.TrimSuffix(strings.TrimPrefix(remainder, "["), "]")
-		if net.ParseIP(bare) != nil || strings.Contains(splitErr.Error(), "missing port in address") {
+		_, ipErr := netip.ParseAddr(bare)
+		if ipErr == nil || strings.Contains(splitErr.Error(), "missing port in address") {
 			if strings.TrimSpace(bare) == "" {
 				return "", "", fmt.Errorf("parse target %q: no host", target)
 			}
