@@ -184,9 +184,38 @@ func paint(s, color string, enabled bool) string {
 	return color + s + colorReset
 }
 
+// errorWriter remembers the first output failure so renderers can use fmt and
+// tabwriter without losing errors from individual writes or buffered flushes.
+// Subsequent writes stop at that failure instead of retrying a partial report.
+type errorWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (w *errorWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	n, err := w.w.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	w.err = err
+	return n, err
+}
+
 // WriteText renders the report as an aligned, scannable text block. ANSI
-// color is applied only when color is true.
-func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
+// color is applied only when color is true. Output failures are returned.
+func WriteText(w io.Writer, r *tlsscan.Report, color bool) error {
+	out := &errorWriter{w: w}
+	writeText(out, r, color)
+	if out.err != nil {
+		return fmt.Errorf("write report: %w", out.err)
+	}
+	return nil
+}
+
+func writeText(w io.Writer, r *tlsscan.Report, color bool) {
 	st := summarize(r)
 
 	target := r.Target
@@ -423,8 +452,17 @@ func batchSortKey(rows []BatchRow) {
 // WriteBatchTable renders one row per host as an aligned summary table sorted by
 // urgency (errored hosts first, then fewest days remaining). When quiet is true,
 // healthy rows are omitted; if every row is healthy nothing is written. The
-// passed slice is sorted in place.
-func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
+// passed slice is sorted in place. Output failures are returned.
+func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) error {
+	out := &errorWriter{w: w}
+	writeBatchTable(out, rows, color, quiet)
+	if out.err != nil {
+		return fmt.Errorf("write batch: %w", out.err)
+	}
+	return nil
+}
+
+func writeBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	batchSortKey(rows)
 
 	visible := rows
@@ -570,7 +608,17 @@ func WriteBatchJSON(w io.Writer, rows []BatchRow, quiet bool) error {
 // and ports without TLS are reported alongside the certificates found. The CERT
 // column shows the leaf subject common name; the STATUS column summarizes
 // validity (VALID, EXPIRING Nd, EXPIRED, NOT YET VALID, no TLS, or closed).
-func WriteSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) {
+// Output failures are returned.
+func WriteSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) error {
+	out := &errorWriter{w: w}
+	writeSweepText(out, sr, color)
+	if out.err != nil {
+		return fmt.Errorf("write sweep: %w", out.err)
+	}
+	return nil
+}
+
+func writeSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) {
 	fmt.Fprintf(w, "%s %s\n\n", paint("tlsee sweep", colorBold, color), sanitize(sr.Host))
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)

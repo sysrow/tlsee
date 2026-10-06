@@ -425,3 +425,44 @@ func TestRunSweepHelp(t *testing.T) {
 		t.Errorf("sweep help wrote to stderr:\n%s", stderr.String())
 	}
 }
+
+type outputErrorWriter struct{ err error }
+
+func (w outputErrorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestRunScanTextOutputError(t *testing.T) {
+	target, closeSrv := tlsTestServerTarget(t)
+	defer closeSrv()
+	outputErr := errors.New("output unavailable")
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{
+		{name: "single"},
+		{name: "table", args: []string{"--table"}},
+		{name: "quiet", args: []string{"--quiet"}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			args := append([]string{"scan", target, "--no-check", "--color", "never", "--insecure"}, mode.args...)
+			var stderr bytes.Buffer
+			if code := Run(args, outputErrorWriter{outputErr}, &stderr); code != exitError {
+				t.Errorf("Run = %d; want %d", code, exitError)
+			}
+			if !strings.Contains(stderr.String(), outputErr.Error()) {
+				t.Errorf("stderr = %q; want output error", stderr.String())
+			}
+		})
+	}
+}
+
+func TestWriteSweepResultTextOutputError(t *testing.T) {
+	outputErr := errors.New("output unavailable")
+	var stderr bytes.Buffer
+	result := &tlsscan.SweepResult{Host: "example.com"}
+	if code := writeSweepResult(result, outputErrorWriter{outputErr}, &stderr, false, false); code != exitError {
+		t.Errorf("writeSweepResult = %d; want %d", code, exitError)
+	}
+	if !strings.Contains(stderr.String(), outputErr.Error()) {
+		t.Errorf("stderr = %q; want output error", stderr.String())
+	}
+}

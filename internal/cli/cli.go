@@ -53,7 +53,7 @@ var errNoTargets = errors.New("at least one target is required")
 // Exit codes returned by Run.
 const (
 	exitOK       = 0 // healthy certificate, or explicitly requested help (or a problem suppressed by --insecure)
-	exitError    = 1 // runtime error: bad flags, missing/extra args, unknown command, connection failure
+	exitError    = 1 // runtime error: bad flags, missing/extra args, unknown command, connection or output failure
 	exitCertProb = 2 // certificate problem, or usage shown for no-args
 	// exitUsage (no-args usage) intentionally shares exitCertProb's value;
 	// defining it in terms of exitCertProb keeps them from silently diverging.
@@ -205,7 +205,10 @@ func scanSingle(ctx context.Context, stdout, stderr io.Writer, target string, op
 			return exitError
 		}
 	} else {
-		report.WriteText(stdout, rep, useColor)
+		if err := report.WriteText(stdout, rep, useColor); err != nil {
+			fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
+			return exitError
+		}
 	}
 
 	if insecure {
@@ -234,7 +237,10 @@ func scanBatch(ctx context.Context, stdout, stderr io.Writer, targets []string, 
 			return exitError
 		}
 	} else {
-		report.WriteBatchTable(stdout, rows, useColor, quiet)
+		if err := report.WriteBatchTable(stdout, rows, useColor, quiet); err != nil {
+			fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
+			return exitError
+		}
 	}
 
 	if insecure {
@@ -466,7 +472,10 @@ func writeSweepResult(sr *tlsscan.SweepResult, stdout, stderr io.Writer, asJSON,
 			return exitError
 		}
 	} else {
-		report.WriteSweepText(stdout, sr, useColor)
+		if err := report.WriteSweepText(stdout, sr, useColor); err != nil {
+			fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
+			return exitError
+		}
 	}
 	if sr.PortsNotProbed > 0 {
 		total := len(sr.Ports) + sr.PortsNotProbed
@@ -548,6 +557,7 @@ func printScanUsage(w io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(w, "Usage: tlsee scan <target>... [flags]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "One or more targets, and/or -f/--file with one target per line.")
+	fmt.Fprintln(w, "Connection or report output failures exit 1, even with --insecure.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fs.SetOutput(w)
@@ -562,6 +572,7 @@ func printSweepUsage(w io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(w, "By default a curated list of well-known TLS and STARTTLS ports is scanned.")
 	fmt.Fprintln(w, "--full scans all 65535 ports and is slow.")
 	fmt.Fprintln(w, "An interrupted sweep (Ctrl-C, SIGTERM) prints the ports probed so far and exits 1.")
+	fmt.Fprintln(w, "Report output failures also exit 1.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fs.SetOutput(w)
@@ -636,13 +647,15 @@ Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon
      (also when help is explicitly requested)
   1  runtime error: bad flags, missing target, unknown command,
-     connection failure, or a sweep interrupted before every port was
-     probed
+     connection or report output failure, or a sweep interrupted before
+     every port was probed
   2  usage shown for no arguments, or a certificate problem: expired, not
      yet valid, untrusted, hostname mismatch, or expiring within --warn-days
      (a certificate problem is suppressed by --insecure)
 
 In batch mode the exit code is the worst per-host code: 2 if any certificate
-has a problem, 1 if any host failed to scan, else 0.
+has a problem, 1 if any host failed to scan, else 0. Report output failures
+exit 1 regardless of per-host codes. --insecure does not suppress connection
+or report output failures.
 `)
 }

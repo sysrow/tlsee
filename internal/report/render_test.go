@@ -3,6 +3,9 @@ package report
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"testing"
@@ -709,5 +712,80 @@ func TestBatchNoteReportsMovedSANs(t *testing.T) {
 	WriteBatchTable(&buf, rows, false, false)
 	if !strings.Contains(buf.String(), "2 elsewhere") {
 		t.Errorf("batch table missing the moved-SAN note; got:\n%s", buf.String())
+	}
+}
+
+// limitedOutputWriter simulates output failing after a partial report, including
+// a short write without an error from a misbehaving underlying writer.
+type limitedOutputWriter struct {
+	remaining int
+	err       error
+	failed    bool
+	retries   int
+}
+
+func (w *limitedOutputWriter) Write(p []byte) (int, error) {
+	if w.failed {
+		w.retries++
+		return 0, w.err
+	}
+	if len(p) <= w.remaining {
+		w.remaining -= len(p)
+		return len(p), nil
+	}
+	n := w.remaining
+	w.remaining = 0
+	w.failed = true
+	return n, w.err
+}
+
+func TestTextOutputErrors(t *testing.T) {
+	r := fixedReport()
+	r.Warnings = []string{"example warning"}
+	r.SANChecks = []tlsscan.SANCheck{{Name: "*.example.com", Wildcard: true}}
+	r.IPCerts = []tlsscan.IPCert{{IP: "192.0.2.1", SubjectCN: "example.com", DaysRemaining: 90}}
+	outputErr := errors.New("output unavailable")
+	for _, colored := range []bool{false, true} {
+		for _, renderer := range []struct {
+			name  string
+			write func(io.Writer) error
+		}{
+			{"report", func(w io.Writer) error { return WriteText(w, r, colored) }},
+			{"batch", func(w io.Writer) error { return WriteBatchTable(w, batchRows(), colored, false) }},
+			{"sweep", func(w io.Writer) error { return WriteSweepText(w, sweepFixture(), colored) }},
+		} {
+			t.Run(fmt.Sprintf("%s/color=%t", renderer.name, colored), func(t *testing.T) {
+				var complete bytes.Buffer
+				if err := renderer.write(&complete); err != nil {
+					t.Fatalf("successful output returned %v", err)
+				}
+				for _, limit := range []int{0, complete.Len() / 2, complete.Len() - 1} {
+					for _, failure := range []error{outputErr, nil} {
+						w := &limitedOutputWriter{remaining: limit, err: failure}
+						wantErr := failure
+						if wantErr == nil {
+							wantErr = io.ErrShortWrite
+						}
+						if err := renderer.write(w); !errors.Is(err, wantErr) {
+							t.Errorf("limit %d: error = %v; want %v", limit, err, wantErr)
+						}
+						if w.retries != 0 {
+							t.Errorf("limit %d: retried failed output %d times", limit, w.retries)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestQuietTextWithoutOutputDoesNotFail(t *testing.T) {
+	w := &limitedOutputWriter{err: errors.New("output unavailable")}
+	rows := []BatchRow{{Host: "example.com", Report: fixedReport()}}
+	if err := WriteBatchTable(w, rows, false, true); err != nil {
+		t.Fatalf("quiet healthy report returned %v", err)
+	}
+	if w.failed {
+		t.Error("quiet healthy report attempted output")
 	}
 }

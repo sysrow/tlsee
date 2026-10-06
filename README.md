@@ -211,11 +211,12 @@ are advisory only: they do **not** change the exit code or the status headline.
 | Code | Meaning                                                                  |
 | ---- | ------------------------------------------------------------------------ |
 | `0`  | Healthy: trusted chain, hostname matches, valid, and not expiring soon. Also when help is explicitly requested (`help`, `-h`, `--help`), which is written to stdout. |
-| `1`  | Runtime error: bad flags, missing target, unknown command, connection failure, or a sweep interrupted before every port was probed. |
+| `1`  | Runtime error: bad flags, missing target, unknown command, connection or report output failure, or a sweep interrupted before every port was probed. |
 | `2`  | Usage shown for no arguments, or a certificate problem: expired, not yet valid, untrusted, hostname mismatch, or expiring within `--warn-days`. A certificate problem is suppressed by `--insecure`. |
 
-With `--insecure`, the certificate is still retrieved and printed; only the
-exit code is forced to `0`.
+With `--insecure`, the certificate is still retrieved and printed; certificate
+problems no longer affect the exit code. Connection and report output failures
+still exit `1`. A report output failure takes precedence over per-host codes.
 
 In batch mode the exit code is the worst per-host code: `2` if any certificate
 has a problem, `1` if any host failed to scan, otherwise `0`. The `sweep`
