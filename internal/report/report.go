@@ -293,7 +293,7 @@ func writeText(w io.Writer, r *tlsscan.Report, color bool) {
 		}
 	}
 
-	if len(r.SANChecks) > 0 {
+	if len(r.SANChecks) > 0 || r.SANsNotProbed > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "  SAN liveness:")
 		stw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
@@ -302,6 +302,14 @@ func writeText(w io.Writer, r *tlsscan.Report, color bool) {
 			fmt.Fprintf(stw, "    %s\t%s\t%s\n", sanitize(c.Name), addrs, paint(state, stColor, color))
 		}
 		stw.Flush()
+		if r.SANsNotProbed > 0 {
+			noun := "names"
+			if r.SANsNotProbed == 1 {
+				noun = "name"
+			}
+			note := fmt.Sprintf("%d SAN %s not probed (limit or cancellation)", r.SANsNotProbed, noun)
+			fmt.Fprintf(w, "    %s\n", paint(note, colorYellow, color))
+		}
 	}
 
 	if len(r.IPCerts) > 0 {
@@ -413,11 +421,18 @@ func rowStatus(row BatchRow) batchStatus {
 		return batchStatus{status: "ERROR", days: "ERR", note: "-", color: colorRed}
 	}
 	r := row.Report
-	// The note stays a bare dead count in the common case, and only widens to
-	// name both figures when some name has moved away from the host.
+	// The note stays a bare dead count in the common case, and names the
+	// individual counts when some names moved or checks were incomplete.
 	note := fmt.Sprintf("%d", r.DeadSANs)
-	if r.SANsElsewhere > 0 {
-		note = fmt.Sprintf("%d dead, %d elsewhere", r.DeadSANs, r.SANsElsewhere)
+	if r.SANsElsewhere > 0 || r.SANsNotProbed > 0 {
+		notes := []string{fmt.Sprintf("%d dead", r.DeadSANs)}
+		if r.SANsElsewhere > 0 {
+			notes = append(notes, fmt.Sprintf("%d elsewhere", r.SANsElsewhere))
+		}
+		if r.SANsNotProbed > 0 {
+			notes = append(notes, fmt.Sprintf("%d not probed", r.SANsNotProbed))
+		}
+		note = strings.Join(notes, ", ")
 	}
 	days := fmt.Sprintf("%d", r.Leaf.DaysRemaining)
 	switch {
