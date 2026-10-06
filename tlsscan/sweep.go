@@ -68,7 +68,7 @@ func DefaultSweepPorts() []int {
 // Sweep probes each requested port of host concurrently and returns one result
 // per fully probed port, sorted ascending by port. Per-port failures are
 // captured in the PortResult rather than returned as an error; an error is
-// returned only for an invalid host or an empty port list. When ctx is
+// returned only for an empty host or an out-of-range port. When ctx is
 // canceled mid-sweep the ports probed so far are returned and the rest are
 // counted in PortsNotProbed, so the caller can tell a partial sweep from a
 // complete one.
@@ -80,6 +80,13 @@ func Sweep(ctx context.Context, host string, opts SweepOptions) (*SweepResult, e
 	ports := opts.Ports
 	if len(ports) == 0 {
 		ports = DefaultSweepPorts()
+	}
+	// Validate the full request before launching any probes. Library callers
+	// can supply Ports directly without passing through ParsePortSpec.
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("sweep: port %d out of range (1-65535)", port)
+		}
 	}
 
 	timeout := opts.Timeout

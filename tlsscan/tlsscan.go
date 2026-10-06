@@ -204,7 +204,7 @@ var lookupIP = net.DefaultResolver.LookupIP
 // SweepOptions controls a multi-port sweep of a single host.
 type SweepOptions struct {
 	// Ports is the explicit list of ports to probe. When empty, the curated
-	// default port table is used.
+	// default port table is used. Each port must be in the range 1-65535.
 	Ports []int
 	// Timeout bounds each per-port probe (TCP connect plus any STARTTLS and
 	// handshake). Defaults to defaultSweepTimeout so closed ports fail fast.
@@ -848,9 +848,16 @@ func parseTarget(target, defaultPortOverride string) (host, port string, err err
 		// "too many colons in address".
 		bare := strings.TrimSuffix(strings.TrimPrefix(remainder, "["), "]")
 		if net.ParseIP(bare) != nil || strings.Contains(splitErr.Error(), "missing port in address") {
+			if strings.TrimSpace(bare) == "" {
+				return "", "", fmt.Errorf("parse target %q: no host", target)
+			}
 			return bare, port, nil
 		}
 		return "", "", fmt.Errorf("parse target %q: %w", target, splitErr)
+	}
+
+	if strings.TrimSpace(h) == "" {
+		return "", "", fmt.Errorf("parse target %q: no host", target)
 	}
 
 	if p != "" {
