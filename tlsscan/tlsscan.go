@@ -739,13 +739,16 @@ func probeIPCerts(ctx context.Context, host, port, sni, proto string, resolved [
 // probeIPCert connects to a single resolved address, presenting sni, and
 // retrieves its leaf certificate. proto is the STARTTLS mechanism negotiated
 // before the handshake ("" for direct TLS), mirroring Scan's main path so
-// --all-ips works for STARTTLS services. Any failure is captured in
-// IPCert.Error.
+// --all-ips works for STARTTLS services. Timeout bounds the entire connection,
+// STARTTLS negotiation, and TLS handshake. Any failure is captured in IPCert.Error.
 func probeIPCert(ctx context.Context, ip, port, sni, proto string, timeout time.Duration) IPCert {
 	res := IPCert{IP: ip}
 	addr := net.JoinHostPort(ip, port)
 
-	conn, err := dialPlaintext(ctx, addr, timeout)
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, err := dialPlaintext(probeCtx, addr, timeout)
 	if err != nil {
 		res.Error = err.Error()
 		return res
@@ -753,13 +756,13 @@ func probeIPCert(ctx context.Context, ip, port, sni, proto string, timeout time.
 	defer conn.Close()
 
 	if proto != "" {
-		if err := startTLSNegotiate(ctx, conn, proto, timeout); err != nil {
+		if err := startTLSNegotiate(probeCtx, conn, proto, timeout); err != nil {
 			res.Error = err.Error()
 			return res
 		}
 	}
 
-	tlsConn, err := tlsHandshake(ctx, conn, sni, timeout)
+	tlsConn, err := tlsHandshake(probeCtx, conn, sni, timeout)
 	if err != nil {
 		res.Error = err.Error()
 		return res
