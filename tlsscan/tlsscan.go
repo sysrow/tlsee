@@ -168,7 +168,7 @@ type Report struct {
 	SANsElsewhere int `json:"sansElsewhere"`
 	// SANsNotProbed is the number of SAN names skipped by the liveness check,
 	// either because the certificate exceeded maxSANChecks names or because
-	// the scan was canceled before they were probed.
+	// the scan was canceled before their checks completed.
 	SANsNotProbed int `json:"sansNotProbed,omitempty"`
 	// Warnings holds informational hygiene findings (weak TLS version, weak
 	// signature algorithm, weak RSA key, or a weak negotiated cipher suite).
@@ -282,12 +282,9 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 	}
 	warnDays := defaultWarnDays
 
-	// Bound the entire scan (connect + STARTTLS + handshake + DNS + SAN/AllIPs
-	// probes) by a single timeout budget, mirroring how the sweep engine wraps
-	// one per-port context. The per-call timeout argument is kept as the dialer
-	// and handshake deadline; threading scanCtx as the base makes the nested
-	// per-phase contexts take the min of the two, so the whole scan cannot exceed
-	// --timeout no matter how many phases run.
+	// Bound connect + STARTTLS + handshake by a single timeout budget. Each
+	// phase inherits the remaining budget through scanCtx; post-handshake
+	// enrichment runs separately on the caller's context with its own timeouts.
 	scanCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -362,7 +359,7 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 
 	// DNS resolution is best-effort and skipped for IP literals. It is
 	// bounded by its own timeout-derived context so a slow resolver cannot
-	// make the scan exceed --timeout.
+	// hold up enrichment indefinitely.
 	// Post-handshake enrichment (DNS resolution, SAN liveness, per-IP probing)
 	// runs on the original ctx, NOT scanCtx. scanCtx's single --timeout budget
 	// is depleted by the connect and handshake; reusing it here would give the
@@ -464,9 +461,15 @@ func checkSANs(ctx context.Context, names []string, port string, timeout time.Du
 		names = names[:maxSANChecks]
 	}
 	checks = make([]SANCheck, len(names))
+	completed := make([]bool, len(names))
 	sem := make(chan struct{}, sanProbeConcurrency)
 	var wg sync.WaitGroup
+	dispatched := 0
+dispatch:
 	for i, name := range names {
+		if ctx.Err() != nil {
+			break
+		}
 		// Acquire a slot, but stop dispatching promptly on cancellation
 		// (Ctrl-C/SIGTERM) instead of launching every remaining probe. Names
 		// never dispatched are counted as not probed rather than left as
@@ -474,44 +477,61 @@ func checkSANs(ctx context.Context, names []string, port string, timeout time.Du
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			// Truncate only after the in-flight probes finish: the spawned
-			// goroutines read the checks slice header through their closure, so
-			// reassigning it before Wait would race with them.
-			notProbed += len(names) - i
-			wg.Wait()
-			return checks[:i], notProbed
+			break dispatch
 		}
+		dispatched++
 		wg.Add(1)
 		go func(i int, name string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			checks[i] = checkSAN(ctx, name, port, timeout, sctx)
+			checks[i], completed[i] = checkSAN(ctx, name, port, timeout, sctx)
 		}(i, name)
 	}
 	wg.Wait()
+	// Compact only after every worker finishes writing its slot. Both checks
+	// never started and checks interrupted in flight count as not probed.
+	probed := checks[:0]
+	for i := 0; i < dispatched; i++ {
+		if completed[i] {
+			probed = append(probed, checks[i])
+		}
+	}
+	notProbed += len(names) - len(probed)
+	checks = probed
 	return checks, notProbed
 }
 
 // checkSAN resolves a single SAN name and TCP-probes each resolved address.
 // Wildcard names (for example "*.example.com") cannot be resolved as-is, so
 // they are reported but not probed.
-func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sctx sanContext) SANCheck {
+// The second result reports whether the check completed. Caller cancellation
+// leaves no verdict; a per-probe timeout still counts as a completed check.
+func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sctx sanContext) (SANCheck, bool) {
 	sc := SANCheck{Name: name}
+	if ctx.Err() != nil {
+		return sc, false
+	}
 	if strings.HasPrefix(name, "*.") {
 		sc.Wildcard = true
-		return sc
+		return sc, true
 	}
 
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ips, err := lookupIP(lookupCtx, "ip", name)
 	if err != nil || len(ips) == 0 {
-		return sc // Resolved stays false.
+		return sc, ctx.Err() == nil // Resolved stays false.
 	}
 	sc.Resolved = true
 
 	for _, ip := range ips {
+		if ctx.Err() != nil {
+			return sc, false
+		}
 		ok, probeErr := probeAddr(ctx, ip.String(), port, timeout)
+		if !ok && ctx.Err() != nil {
+			return sc, false
+		}
 		ac := AddrCheck{IP: ip.String(), Reachable: ok}
 		if !ok && probeErr != nil {
 			ac.Error = probeErr.Error()
@@ -527,8 +547,11 @@ func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sct
 	// further diagnosis.
 	if sc.Resolved && sc.Reachable {
 		sc.Ownership = classifyOwnership(ctx, sc.Addrs, name, port, timeout, sctx)
+		if sc.Ownership == OwnershipUnverified && ctx.Err() != nil {
+			return sc, false
+		}
 	}
-	return sc
+	return sc, true
 }
 
 // hostAddrSet builds the set of addresses belonging to the scanned host, used

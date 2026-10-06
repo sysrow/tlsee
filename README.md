@@ -199,6 +199,9 @@ concurrently. Dead SANs are reported but do **not** change the exit code, which
 reflects the certificate's own validity. Use `--no-check` to skip the check for
 a faster scan.
 
+Checks interrupted by cancellation are counted in `sansNotProbed` in JSON
+instead of being reported as dead or moved names. Completed checks are retained.
+
 ## Hygiene warnings
 
 A scan also reports informational hardening warnings derived from the
