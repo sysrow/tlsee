@@ -320,19 +320,34 @@ func worstExitCode(rows []report.BatchRow) int {
 // may instead come from a host file).
 //
 // A "--" end-of-flags terminator is honored once, at the top level: everything
-// after the first "--" is treated as positional verbatim and never re-parsed as
-// flags. The stdlib flag package only honors "--" within a single Parse call,
+// after a standalone "--" is treated as positional verbatim and never re-parsed
+// as flags. A non-boolean flag can consume "--" as its value instead. The stdlib
+// flag package only honors "--" within a single Parse call,
 // so without this the terminator would lose effect on the loop's later
 // iterations. Splitting here keeps standard Unix flag semantics for both the
 // scan and sweep subcommands, which share this function.
 func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	rest := args
 	var trailing []string
-	for i, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--" {
 			rest = args[:i]
 			trailing = args[i+1:]
 			break
+		}
+		if len(a) < 2 || a[0] != '-' {
+			continue
+		}
+		name := strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-")
+		if strings.Contains(name, "=") {
+			continue // The value is already in the flag argument.
+		}
+		if f := fs.Lookup(name); f != nil {
+			boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+			if !ok || !boolFlag.IsBoolFlag() {
+				i++ // Skip the required value, even when it is "--".
+			}
 		}
 	}
 

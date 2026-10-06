@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"io"
 	"os"
@@ -60,6 +61,91 @@ func TestParseInterspersed(t *testing.T) {
 			}
 			if *asJSON != tc.wantJSON {
 				t.Errorf("json = %v; want %v", *asJSON, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestParseInterspersedValueBoundaries distinguishes a terminator from a value
+// consumed by a non-boolean flag. The standard parser remains responsible for
+// validating values and producing help and error diagnostics.
+func TestParseInterspersedValueBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantTargets []string
+		wantFile    string
+		wantJSON    bool
+	}{
+		{"double dash value", []string{"--file", "--", "host", "--json"}, []string{"host"}, "--", true},
+		{"single dash flag", []string{"-file", "--", "host"}, []string{"host"}, "--", false},
+		{"short alias", []string{"host", "-f", "--", "--json"}, []string{"host"}, "--", true},
+		{"value between targets", []string{"first", "--file", "--", "second", "--json"}, []string{"first", "second"}, "--", true},
+		{"value before terminator", []string{"--file", "--", "--", "--json", "--help", "--"}, []string{"--json", "--help", "--"}, "--", false},
+		{"inline value", []string{"--file=--", "--", "--json"}, []string{"--json"}, "--", false},
+		{"empty inline value", []string{"--file=", "--", "--json"}, []string{"--json"}, "", false},
+		{"empty separate value", []string{"--file", "", "--json", "host"}, []string{"host"}, "", true},
+		{"help as value", []string{"--file", "--help", "host"}, []string{"host"}, "--help", false},
+		{"flag as value", []string{"--file", "--json", "host"}, []string{"host"}, "--json", false},
+		{"single dash value", []string{"--file", "-", "host"}, []string{"host"}, "-", false},
+		{"boolean before terminator", []string{"--json", "--", "--file", "--help"}, []string{"--file", "--help"}, "", true},
+		{"explicit boolean before terminator", []string{"--json=false", "--", "--file"}, []string{"--file"}, "", false},
+		{"boolean separate false is positional", []string{"--json", "false", "--file", "--"}, []string{"false"}, "--", true},
+		{"terminator at end", []string{"host", "--"}, []string{"host"}, "", false},
+		{"single dash positional", []string{"-", "--file", "--"}, []string{"-"}, "--", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			file := fs.String("file", "", "")
+			fs.StringVar(file, "f", "", "")
+			asJSON := fs.Bool("json", false, "")
+			targets, err := parseInterspersed(fs, tc.args)
+			if err != nil {
+				t.Fatalf("parseInterspersed(%q): %v", tc.args, err)
+			}
+			if !equalStrings(targets, tc.wantTargets) || *file != tc.wantFile || *asJSON != tc.wantJSON {
+				t.Errorf("got targets=%q file=%q json=%t; want targets=%q file=%q json=%t", targets, *file, *asJSON, tc.wantTargets, tc.wantFile, tc.wantJSON)
+			}
+		})
+	}
+}
+
+func TestParseInterspersedStandardDiagnostics(t *testing.T) {
+	for _, args := range [][]string{
+		{"--file"},
+		{"--json", "--file"},
+		{"--count", "--"},
+		{"--json=--"},
+		{"--unknown", "--"},
+		{"---file", "--"},
+		{"--file", "--", "--help"},
+		{"--file", "--", "--h"},
+		{"--file", "--", "-help"},
+		{"--file", "--", "-h"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			newFlags := func(output io.Writer) *flag.FlagSet {
+				fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+				fs.SetOutput(output)
+				fs.String("file", "", "")
+				fs.Bool("json", false, "")
+				fs.Int("count", 0, "")
+				return fs
+			}
+			var standardOutput, output bytes.Buffer
+			wantErr := newFlags(&standardOutput).Parse(args)
+			if wantErr == nil {
+				t.Fatal("expected standard parser error or help")
+			}
+			// A preceding positional must not alter a flag's diagnostics.
+			_, err := parseInterspersed(newFlags(&output), append([]string{"host"}, args...))
+			if err == nil || err.Error() != wantErr.Error() || errors.Is(err, flag.ErrHelp) != errors.Is(wantErr, flag.ErrHelp) {
+				t.Errorf("error = %v; want %v", err, wantErr)
+			}
+			if output.String() != standardOutput.String() {
+				t.Errorf("diagnostics = %q; want %q", output.String(), standardOutput.String())
 			}
 		})
 	}
@@ -231,6 +317,32 @@ func TestRunDispatch(t *testing.T) {
 			wantCode:       exitOK,
 			wantStdoutHas:  "Usage: tlsee scan",
 			wantStdoutOnly: true,
+		},
+		{
+			name:           "scan help after double dash value",
+			args:           []string{"scan", "host", "--file", "--", "--help"},
+			wantCode:       exitOK,
+			wantStdoutHas:  "Usage: tlsee scan",
+			wantStdoutOnly: true,
+		},
+		{
+			name:           "sweep help after double dash value",
+			args:           []string{"sweep", "host", "--ports", "--", "--help"},
+			wantCode:       exitOK,
+			wantStdoutHas:  "Usage: tlsee sweep",
+			wantStdoutOnly: true,
+		},
+		{
+			name:          "scan validates double dash color value",
+			args:          []string{"scan", "host", "--color", "--"},
+			wantCode:      exitError,
+			wantStderrHas: "invalid --color value",
+		},
+		{
+			name:          "sweep validates double dash color value",
+			args:          []string{"sweep", "host", "--color", "--"},
+			wantCode:      exitError,
+			wantStderrHas: "invalid --color value",
 		},
 		{
 			name:          "scan invalid --starttls rejected up front exit 1",
