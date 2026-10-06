@@ -82,7 +82,10 @@ func allCipherSuiteIDs() []uint16 {
 // conn before the TLS handshake. It uses connection deadlines (derived from
 // timeout) for every read and write so a silent server cannot stall a scan. It
 // returns a clear error when the server does not offer STARTTLS for proto.
-func startTLSNegotiate(ctx context.Context, conn net.Conn, proto string, timeout time.Duration) error {
+func startTLSNegotiate(ctx context.Context, conn net.Conn, proto string, timeout time.Duration) (retErr error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	deadline := time.Now().Add(timeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
@@ -90,6 +93,23 @@ func startTLSNegotiate(ctx context.Context, conn net.Conn, proto string, timeout
 	if err := conn.SetDeadline(deadline); err != nil {
 		return err
 	}
+
+	// A deadline alone does not wake blocked I/O when the caller cancels early.
+	// Interrupt both reads and writes, and join the callback before returning so
+	// it cannot race with the following TLS handshake's deadline reset.
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(interrupted)
+	})
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+		if err := ctx.Err(); err != nil {
+			retErr = err
+		}
+	}()
 
 	// Bound the plaintext reply stream so a malicious server cannot accumulate a
 	// huge newline-less line in the bufio buffer. Protocol greetings and replies
