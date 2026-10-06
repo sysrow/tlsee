@@ -2,6 +2,7 @@ package tlsscan
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -161,7 +162,7 @@ func readReplyLine(br *bufio.Reader) (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
-// readNumericReply reads a possibly multiline SMTP/FTP reply. Continuation
+// readNumericReply reads a possibly multiline SMTP reply. Continuation
 // lines have a hyphen as the fourth byte ("250-..."); the final line has a
 // space ("250 ..."). It returns the three-digit status code of the final line.
 func readNumericReply(br *bufio.Reader) (string, error) {
@@ -178,6 +179,36 @@ func readNumericReply(br *bufio.Reader) (string, error) {
 			continue // continuation line
 		}
 		return line[:3], nil
+	}
+}
+
+// readFTPReply consumes a complete FTP reply. Unlike SMTP, FTP permits
+// arbitrary intermediate text in multiline replies (RFC 959, section 4.2).
+// Only the opening code followed by a space terminates a multiline reply.
+func readFTPReply(br *bufio.Reader) (string, error) {
+	line, err := readReplyLine(br)
+	if err != nil {
+		return "", err
+	}
+	if len(line) < 3 || line[0] < '1' || line[0] > '5' ||
+		line[1] < '0' || line[1] > '9' || line[2] < '0' || line[2] > '9' {
+		return "", fmt.Errorf("invalid FTP reply: %q", line)
+	}
+	code := line[:3]
+	if len(line) == 3 || line[3] == ' ' {
+		return code, nil
+	}
+	if line[3] != '-' {
+		return "", fmt.Errorf("invalid FTP reply: %q", line)
+	}
+	for {
+		line, err = readReplyLine(br)
+		if err != nil {
+			return "", err
+		}
+		if strings.HasPrefix(line, code+" ") {
+			return code, nil
+		}
 	}
 }
 
@@ -216,7 +247,10 @@ func startTLSIMAP(conn net.Conn, br *bufio.Reader) error {
 	// A usable greeting is "* OK" (connection ready) or "* PREAUTH" (already
 	// authenticated, e.g. by a local transport). "* BYE" and anything else mean
 	// the server is rejecting the session, so do not proceed.
-	if !strings.HasPrefix(greeting, "* OK") && !strings.HasPrefix(greeting, "* PREAUTH") {
+	_, greetingStatus, _ := strings.Cut(greeting, " ")
+	greetingStatus, _, _ = strings.Cut(greetingStatus, " ")
+	if !strings.HasPrefix(greeting, "* ") ||
+		(!strings.EqualFold(greetingStatus, "OK") && !strings.EqualFold(greetingStatus, "PREAUTH")) {
 		return fmt.Errorf("imap greeting not OK: %q", greeting)
 	}
 	if _, err := io.WriteString(conn, "a1 STARTTLS\r\n"); err != nil {
@@ -229,7 +263,8 @@ func startTLSIMAP(conn net.Conn, br *bufio.Reader) error {
 			return fmt.Errorf("read STARTTLS reply: %w", err)
 		}
 		if strings.HasPrefix(line, "a1 ") {
-			if !strings.HasPrefix(line, "a1 OK") {
+			status, _, _ := strings.Cut(strings.TrimPrefix(line, "a1 "), " ")
+			if !strings.EqualFold(status, "OK") {
 				return fmt.Errorf("server does not offer STARTTLS: %q", line)
 			}
 			return nil
@@ -261,7 +296,7 @@ func startTLSPOP3(conn net.Conn, br *bufio.Reader) error {
 
 // startTLSFTP negotiates AUTH TLS on an FTP connection.
 func startTLSFTP(conn net.Conn, br *bufio.Reader) error {
-	if code, err := readNumericReply(br); err != nil {
+	if code, err := readFTPReply(br); err != nil {
 		return fmt.Errorf("read ftp greeting: %w", err)
 	} else if code != "220" {
 		return fmt.Errorf("ftp greeting not ready: %s", code)
@@ -269,7 +304,7 @@ func startTLSFTP(conn net.Conn, br *bufio.Reader) error {
 	if _, err := io.WriteString(conn, "AUTH TLS\r\n"); err != nil {
 		return fmt.Errorf("send AUTH TLS: %w", err)
 	}
-	if code, err := readNumericReply(br); err != nil {
+	if code, err := readFTPReply(br); err != nil {
 		return fmt.Errorf("read AUTH TLS reply: %w", err)
 	} else if code != "234" {
 		return fmt.Errorf("server does not offer AUTH TLS: %s", code)
@@ -312,11 +347,9 @@ var ldapStartTLSRequest = []byte{
 }
 
 // startTLSLDAP sends the LDAP StartTLS extended request and consumes the
-// server's complete extendedResponse PDU. The response is parsed best-effort:
-// only the outer SEQUENCE header is decoded, and a well-formed PDU is treated
-// as success, letting the TLS handshake surface a clear error if the server
-// actually refused. Consuming the whole PDU matters: any unread response bytes
-// would be read by the TLS client afterwards and corrupt the handshake.
+// complete response PDU before checking its message ID, operation and result.
+// A non-success result leaves the connection in LDAP mode and must not be
+// followed by a TLS handshake (RFC 4511, section 4.14.2).
 func startTLSLDAP(conn net.Conn) error {
 	if _, err := conn.Write(ldapStartTLSRequest); err != nil {
 		return fmt.Errorf("send ldap StartTLS: %w", err)
@@ -325,10 +358,73 @@ func startTLSLDAP(conn net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("read ldap StartTLS reply: %w", err)
 	}
-	if _, err := io.CopyN(io.Discard, conn, int64(n)); err != nil {
+	body := make([]byte, n)
+	if _, err := io.ReadFull(conn, body); err != nil {
 		return fmt.Errorf("read ldap StartTLS reply: %w", err)
 	}
+	if err := checkLDAPStartTLSResponse(body); err != nil {
+		return fmt.Errorf("ldap StartTLS reply: %w", err)
+	}
 	return nil
+}
+
+func checkLDAPStartTLSResponse(body []byte) error {
+	message := bytes.NewReader(body)
+	id, err := readLDAPField(message, 0x02) // INTEGER messageID
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(id, []byte{1}) {
+		return fmt.Errorf("unexpected message ID %x (want 1)", id)
+	}
+	response, err := readLDAPField(message, 0x78) // [APPLICATION 24] ExtendedResponse
+	if err != nil {
+		return err
+	}
+	result := bytes.NewReader(response)
+	code, err := readLDAPField(result, 0x0a) // ENUMERATED resultCode
+	if err != nil {
+		return err
+	}
+	if len(code) == 0 || len(code) > 4 || code[0]&0x80 != 0 {
+		return fmt.Errorf("invalid result code")
+	}
+	var resultCode uint32
+	for _, b := range code {
+		resultCode = resultCode<<8 | uint32(b)
+	}
+	if _, err := readLDAPField(result, 0x04); err != nil { // matchedDN
+		return err
+	}
+	if _, err := readLDAPField(result, 0x04); err != nil { // diagnosticMessage
+		return err
+	}
+	if resultCode != 0 {
+		return fmt.Errorf("server does not offer StartTLS: result code %d", resultCode)
+	}
+	return nil
+}
+
+// readLDAPField accepts definite BER lengths, including long-form encodings
+// for short fields. encoding/asn1 enforces DER and rejects those valid BER forms.
+func readLDAPField(reader *bytes.Reader, expectedTag byte) ([]byte, error) {
+	tag, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if tag != expectedTag {
+		return nil, fmt.Errorf("unexpected BER tag 0x%02x (want 0x%02x)", tag, expectedTag)
+	}
+	n, err := readBERLength(reader)
+	if err != nil {
+		return nil, err
+	}
+	if n > reader.Len() {
+		return nil, io.ErrUnexpectedEOF
+	}
+	field := make([]byte, n)
+	_, err = io.ReadFull(reader, field)
+	return field, err
 }
 
 // readBERHeader reads a BER SEQUENCE tag and definite-form length from conn
@@ -337,17 +433,25 @@ func startTLSLDAP(conn net.Conn) error {
 // a malicious server cannot make the negotiator read an arbitrarily large
 // reply.
 func readBERHeader(conn net.Conn) (int, error) {
-	var hdr [2]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+	var tag [1]byte
+	if _, err := io.ReadFull(conn, tag[:]); err != nil {
 		return 0, err
 	}
-	if hdr[0] != 0x30 {
-		return 0, fmt.Errorf("not an LDAP message (tag 0x%02x)", hdr[0])
+	if tag[0] != 0x30 {
+		return 0, fmt.Errorf("not an LDAP message (tag 0x%02x)", tag[0])
 	}
-	if hdr[1] < 0x80 {
-		return int(hdr[1]), nil
+	return readBERLength(conn)
+}
+
+func readBERLength(reader io.Reader) (int, error) {
+	var first [1]byte
+	if _, err := io.ReadFull(reader, first[:]); err != nil {
+		return 0, err
 	}
-	numBytes := int(hdr[1] & 0x7f)
+	if first[0] < 0x80 {
+		return int(first[0]), nil
+	}
+	numBytes := int(first[0] & 0x7f)
 	if numBytes == 0 {
 		return 0, fmt.Errorf("indefinite BER length not allowed")
 	}
@@ -355,7 +459,7 @@ func readBERHeader(conn net.Conn) (int, error) {
 		return 0, fmt.Errorf("BER length of %d bytes too large", numBytes)
 	}
 	buf := make([]byte, numBytes)
-	if _, err := io.ReadFull(conn, buf); err != nil {
+	if _, err := io.ReadFull(reader, buf); err != nil {
 		return 0, err
 	}
 	var n uint64
