@@ -389,3 +389,81 @@ func TestRunDispatch(t *testing.T) {
 		})
 	}
 }
+
+// requestedOutputWriter fails at a byte boundary, allowing the tests to cover
+// both immediately rejected output and partially written help or version text.
+type requestedOutputWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *requestedOutputWriter) Write(p []byte) (int, error) {
+	if len(p) <= w.remaining {
+		w.remaining -= len(p)
+		return len(p), nil
+	}
+	n := w.remaining
+	w.remaining = 0
+	return n, w.err
+}
+
+func TestRequestedOutputFailure(t *testing.T) {
+	outputErr := errors.New("output unavailable")
+	for _, args := range [][]string{
+		{"version"}, {"help"}, {"-h"}, {"--help"},
+		{"scan", "--help"}, {"scan", "host", "-h"},
+		{"sweep", "--help"}, {"sweep", "host", "-help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var successfulOutput, stderr bytes.Buffer
+			if code := Run(args, &successfulOutput, &stderr); code != exitOK || stderr.Len() != 0 {
+				t.Fatalf("successful output returned %d, stderr %q", code, stderr.String())
+			}
+			for _, limit := range []int{0, successfulOutput.Len() / 2, successfulOutput.Len() - 1} {
+				for _, failure := range []error{outputErr, nil} {
+					stderr.Reset()
+					stdout := &requestedOutputWriter{remaining: limit, err: failure}
+					if code := Run(args, stdout, &stderr); code != exitError {
+						t.Errorf("limit %d: exit = %d; want %d", limit, code, exitError)
+					}
+					wantErr := failure
+					if wantErr == nil {
+						wantErr = io.ErrShortWrite
+					}
+					if !strings.Contains(stderr.String(), wantErr.Error()) {
+						t.Errorf("limit %d: stderr = %q; want %q", limit, stderr.String(), wantErr)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDiagnosticOutputFailurePreservesExit(t *testing.T) {
+	failure := outputErrorWriter{errors.New("output unavailable")}
+	for _, args := range [][]string{{"help"}, {"version"}, {"scan", "--help"}, {"sweep", "--help"}} {
+		var stdout bytes.Buffer
+		if code := Run(args, &stdout, failure); code != exitOK {
+			t.Errorf("Run(%q) = %d; successful stdout must not depend on unused stderr", args, code)
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{nil, exitUsage},
+		{[]string{"unknown"}, exitError},
+		{[]string{"scan"}, exitError},
+		{[]string{"scan", "--unknown"}, exitError},
+		{[]string{"sweep"}, exitError},
+		{[]string{"sweep", "--unknown"}, exitError},
+		{[]string{"help"}, exitError},
+		{[]string{"version"}, exitError},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			if code := Run(tc.args, failure, failure); code != tc.want {
+				t.Errorf("exit = %d; want %d", code, tc.want)
+			}
+		})
+	}
+}

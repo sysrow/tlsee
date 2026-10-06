@@ -75,13 +75,11 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "sweep":
 		return runSweep(args[1:], stdout, stderr)
 	case "version":
-		fmt.Fprintf(stdout, "tlsee %s\n", toolVersion())
-		return exitOK
+		return exitCodeForOutput(writeOutput(stdout, fmt.Sprintf("tlsee %s\n", toolVersion())), stderr)
 	case "help", "-h", "--help":
 		// Help was explicitly requested, so it is the requested output:
 		// write to stdout and succeed, keeping the tool pipeable.
-		writeUsage(stdout)
-		return exitOK
+		return exitCodeForOutput(writeUsage(stdout), stderr)
 	default:
 		fmt.Fprintf(stderr, "tlsee: unknown command %q\n\n", args[0])
 		writeUsage(stderr)
@@ -126,8 +124,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		// to stdout and succeed (and "scan host -- --help" treats --help as a
 		// literal target rather than a help request).
 		if errors.Is(err, flag.ErrHelp) {
-			printScanUsage(stdout, fs)
-			return exitOK
+			return exitCodeForOutput(printScanUsage(stdout, fs), stderr)
 		}
 		// A real flag-parse error was already printed to stderr by flag.
 		printScanUsage(stderr, fs)
@@ -423,8 +420,7 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	hosts, err := parseInterspersed(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			printSweepUsage(stdout, fs)
-			return exitOK
+			return exitCodeForOutput(printSweepUsage(stdout, fs), stderr)
 		}
 		printSweepUsage(stderr, fs)
 		return exitError
@@ -554,36 +550,64 @@ func resolveColor(mode string, stdout io.Writer) (bool, error) {
 	}
 }
 
+// writeOutput writes already rendered help or version output and detects an
+// incomplete write even when the supplied writer fails to return an error.
+func writeOutput(w io.Writer, text string) error {
+	n, err := io.WriteString(w, text)
+	if err == nil && n != len(text) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
+// exitCodeForOutput handles requested stdout output. Failure to write the
+// diagnostic to stderr cannot turn a failed command into a successful one.
+func exitCodeForOutput(err error, stderr io.Writer) int {
+	if err != nil {
+		fmt.Fprintf(stderr, "tlsee: write output: %v\n", err)
+		return exitError
+	}
+	return exitOK
+}
+
 // printScanUsage writes the scan subcommand usage and flag list to w.
-func printScanUsage(w io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintln(w, "Usage: tlsee scan <target>... [flags]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "One or more targets, and/or -f/--file with one target per line.")
-	fmt.Fprintln(w, "Connection or report output failures exit 1, even with --insecure.")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Flags:")
-	fs.SetOutput(w)
+func printScanUsage(w io.Writer, fs *flag.FlagSet) error {
+	var text strings.Builder
+	fmt.Fprintln(&text, "Usage: tlsee scan <target>... [flags]")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "One or more targets, and/or -f/--file with one target per line.")
+	fmt.Fprintln(&text, "Connection or output failures exit 1, even with --insecure.")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "Flags:")
+	previousOutput := fs.Output()
+	fs.SetOutput(&text)
 	fs.PrintDefaults()
+	fs.SetOutput(previousOutput)
+	return writeOutput(w, text.String())
 }
 
 // printSweepUsage writes the sweep subcommand usage and flag list to w.
-func printSweepUsage(w io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintln(w, "Usage: tlsee sweep <host> [flags]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Probe many ports of one host for TLS and report each certificate.")
-	fmt.Fprintln(w, "By default a curated list of well-known TLS and STARTTLS ports is scanned.")
-	fmt.Fprintln(w, "--full scans all 65535 ports and is slow.")
-	fmt.Fprintln(w, "An interrupted sweep (Ctrl-C, SIGTERM) prints the ports probed so far and exits 1.")
-	fmt.Fprintln(w, "Report output failures also exit 1.")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Flags:")
-	fs.SetOutput(w)
+func printSweepUsage(w io.Writer, fs *flag.FlagSet) error {
+	var text strings.Builder
+	fmt.Fprintln(&text, "Usage: tlsee sweep <host> [flags]")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "Probe many ports of one host for TLS and report each certificate.")
+	fmt.Fprintln(&text, "By default a curated list of well-known TLS and STARTTLS ports is scanned.")
+	fmt.Fprintln(&text, "--full scans all 65535 ports and is slow.")
+	fmt.Fprintln(&text, "An interrupted sweep (Ctrl-C, SIGTERM) prints the ports probed so far and exits 1.")
+	fmt.Fprintln(&text, "Output failures also exit 1.")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "Flags:")
+	previousOutput := fs.Output()
+	fs.SetOutput(&text)
 	fs.PrintDefaults()
+	fs.SetOutput(previousOutput)
+	return writeOutput(w, text.String())
 }
 
 // writeUsage prints top-level usage and exit-code documentation to w.
-func writeUsage(w io.Writer) {
-	fmt.Fprint(w, `tlsee - a friendly TLS certificate inspector
+func writeUsage(w io.Writer) error {
+	return writeOutput(w, `tlsee - a friendly TLS certificate inspector
 
 Usage:
   tlsee scan <target>... [flags]   Inspect the TLS certificate(s) at one or more targets
@@ -649,15 +673,15 @@ Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon
      (also when help is explicitly requested)
   1  runtime error: bad flags, missing target, unknown command,
-     connection or report output failure, or a sweep interrupted before
+     connection or output failure, or a sweep interrupted before
      every port was probed
   2  usage shown for no arguments, or a certificate problem: expired, not
      yet valid, untrusted, hostname mismatch, or expiring within --warn-days
      (a certificate problem is suppressed by --insecure)
 
 In batch mode the exit code is the worst per-host code: 2 if any certificate
-has a problem, 1 if any host failed to scan, else 0. Report output failures
+has a problem, 1 if any host failed to scan, else 0. Output failures
 exit 1 regardless of per-host codes. --insecure does not suppress connection
-or report output failures.
+or output failures.
 `)
 }
