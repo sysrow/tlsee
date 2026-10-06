@@ -315,6 +315,10 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 
 	state := tlsConn.ConnectionState()
 	elapsed := time.Since(start).Milliseconds()
+	// All remaining work uses the captured certificate state. Release the
+	// primary socket before potentially slow DNS and SAN/per-IP enrichment;
+	// the deferred close above still covers early negotiation failures.
+	conn.Close()
 
 	if len(state.PeerCertificates) == 0 {
 		return nil, fmt.Errorf("connect %s: server presented no certificates", addr)
