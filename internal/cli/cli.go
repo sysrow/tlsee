@@ -554,19 +554,6 @@ func resolveColor(mode string, stdout io.Writer) (bool, error) {
 	}
 }
 
-// isTerminal reports whether w is a character device (a terminal).
-func isTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
-}
-
 // printScanUsage writes the scan subcommand usage and flag list to w.
 func printScanUsage(w io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(w, "Usage: tlsee scan <target>... [flags]")
