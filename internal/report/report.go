@@ -251,7 +251,12 @@ func writeText(w io.Writer, r *tlsscan.Report, color bool) {
 
 	row("Not before", r.Leaf.NotBefore.Format("2006-01-02 15:04:05 MST"))
 	expiry := r.Leaf.NotAfter.Format("2006-01-02 15:04:05 MST")
-	expiry += fmt.Sprintf("  (%s)", daysPhrase(r.Leaf.DaysRemaining))
+	remaining := daysPhrase(r.Leaf.DaysRemaining)
+	// Whole-day truncation leaves zero for up to a day after expiry as well.
+	if r.Leaf.Expired && r.Leaf.DaysRemaining == 0 {
+		remaining = "expired less than a day ago"
+	}
+	expiry += fmt.Sprintf("  (%s)", remaining)
 	row("Not after", paint(expiry, expiryColor(r), color))
 
 	row("Trusted chain", boolText(r.ChainTrusted, color))
@@ -402,7 +407,7 @@ type batchStatus struct {
 
 // rowStatus reduces a BatchRow to its display fields. Errors sort and render
 // first; otherwise the most severe certificate problem wins, mirroring
-// summarize but as compact one-word column values.
+// summarize but as compact column values.
 func rowStatus(row BatchRow) batchStatus {
 	if row.Err != "" {
 		return batchStatus{status: "ERROR", days: "ERR", note: "-", color: colorRed}
@@ -416,8 +421,10 @@ func rowStatus(row BatchRow) batchStatus {
 	}
 	days := fmt.Sprintf("%d", r.Leaf.DaysRemaining)
 	switch {
-	case r.Leaf.Expired, r.Leaf.NotYetValid:
+	case r.Leaf.Expired:
 		return batchStatus{status: "EXPIRED", days: days, note: note, color: colorRed}
+	case r.Leaf.NotYetValid:
+		return batchStatus{status: "NOT YET VALID", days: days, note: note, color: colorRed}
 	case !r.ChainTrusted:
 		return batchStatus{status: "UNTRUSTED", days: days, note: note, color: colorRed}
 	case !r.HostnameMatch:

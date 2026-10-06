@@ -112,7 +112,7 @@ scans every host concurrently and prints a summary table with one row per host:
 | -------- | ----------------------------------------------------------------- |
 | `HOST`   | The target as given.                                              |
 | `DAYS`   | Days remaining, or `ERR` when the host could not be scanned.      |
-| `STATUS` | `VALID`, `EXPIRING`, `EXPIRED`, `UNTRUSTED`, `MISMATCH`, or `ERROR`. |
+| `STATUS` | `VALID`, `EXPIRING`, `EXPIRED`, `NOT YET VALID`, `UNTRUSTED`, `MISMATCH`, or `ERROR`. |
 | `NOTE`   | Count of dead/stale SAN names, or the error text for failed hosts. |
 
 Rows are sorted by urgency: hosts that failed to scan first, then the fewest
