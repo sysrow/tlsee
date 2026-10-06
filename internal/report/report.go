@@ -184,9 +184,38 @@ func paint(s, color string, enabled bool) string {
 	return color + s + colorReset
 }
 
+// errorWriter remembers the first output failure so renderers can use fmt and
+// tabwriter without losing errors from individual writes or buffered flushes.
+// Subsequent writes stop at that failure instead of retrying a partial report.
+type errorWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (w *errorWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	n, err := w.w.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	w.err = err
+	return n, err
+}
+
 // WriteText renders the report as an aligned, scannable text block. ANSI
-// color is applied only when color is true.
-func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
+// color is applied only when color is true. Output failures are returned.
+func WriteText(w io.Writer, r *tlsscan.Report, color bool) error {
+	out := &errorWriter{w: w}
+	writeText(out, r, color)
+	if out.err != nil {
+		return fmt.Errorf("write report: %w", out.err)
+	}
+	return nil
+}
+
+func writeText(w io.Writer, r *tlsscan.Report, color bool) {
 	st := summarize(r)
 
 	target := r.Target
@@ -222,7 +251,12 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 
 	row("Not before", r.Leaf.NotBefore.Format("2006-01-02 15:04:05 MST"))
 	expiry := r.Leaf.NotAfter.Format("2006-01-02 15:04:05 MST")
-	expiry += fmt.Sprintf("  (%s)", daysPhrase(r.Leaf.DaysRemaining))
+	remaining := daysPhrase(r.Leaf.DaysRemaining)
+	// Whole-day truncation leaves zero for up to a day after expiry as well.
+	if r.Leaf.Expired && r.Leaf.DaysRemaining == 0 {
+		remaining = "expired less than a day ago"
+	}
+	expiry += fmt.Sprintf("  (%s)", remaining)
 	row("Not after", paint(expiry, expiryColor(r), color))
 
 	row("Trusted chain", boolText(r.ChainTrusted, color))
@@ -259,7 +293,7 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 		}
 	}
 
-	if len(r.SANChecks) > 0 {
+	if len(r.SANChecks) > 0 || r.SANsNotProbed > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "  SAN liveness:")
 		stw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
@@ -268,6 +302,14 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 			fmt.Fprintf(stw, "    %s\t%s\t%s\n", sanitize(c.Name), addrs, paint(state, stColor, color))
 		}
 		stw.Flush()
+		if r.SANsNotProbed > 0 {
+			noun := "names"
+			if r.SANsNotProbed == 1 {
+				noun = "name"
+			}
+			note := fmt.Sprintf("%d SAN %s not probed (limit or cancellation)", r.SANsNotProbed, noun)
+			fmt.Fprintf(w, "    %s\n", paint(note, colorYellow, color))
+		}
 	}
 
 	if len(r.IPCerts) > 0 {
@@ -373,22 +415,31 @@ type batchStatus struct {
 
 // rowStatus reduces a BatchRow to its display fields. Errors sort and render
 // first; otherwise the most severe certificate problem wins, mirroring
-// summarize but as compact one-word column values.
+// summarize but as compact column values.
 func rowStatus(row BatchRow) batchStatus {
 	if row.Err != "" {
 		return batchStatus{status: "ERROR", days: "ERR", note: "-", color: colorRed}
 	}
 	r := row.Report
-	// The note stays a bare dead count in the common case, and only widens to
-	// name both figures when some name has moved away from the host.
+	// The note stays a bare dead count in the common case, and names the
+	// individual counts when some names moved or checks were incomplete.
 	note := fmt.Sprintf("%d", r.DeadSANs)
-	if r.SANsElsewhere > 0 {
-		note = fmt.Sprintf("%d dead, %d elsewhere", r.DeadSANs, r.SANsElsewhere)
+	if r.SANsElsewhere > 0 || r.SANsNotProbed > 0 {
+		notes := []string{fmt.Sprintf("%d dead", r.DeadSANs)}
+		if r.SANsElsewhere > 0 {
+			notes = append(notes, fmt.Sprintf("%d elsewhere", r.SANsElsewhere))
+		}
+		if r.SANsNotProbed > 0 {
+			notes = append(notes, fmt.Sprintf("%d not probed", r.SANsNotProbed))
+		}
+		note = strings.Join(notes, ", ")
 	}
 	days := fmt.Sprintf("%d", r.Leaf.DaysRemaining)
 	switch {
-	case r.Leaf.Expired, r.Leaf.NotYetValid:
+	case r.Leaf.Expired:
 		return batchStatus{status: "EXPIRED", days: days, note: note, color: colorRed}
+	case r.Leaf.NotYetValid:
+		return batchStatus{status: "NOT YET VALID", days: days, note: note, color: colorRed}
 	case !r.ChainTrusted:
 		return batchStatus{status: "UNTRUSTED", days: days, note: note, color: colorRed}
 	case !r.HostnameMatch:
@@ -423,8 +474,17 @@ func batchSortKey(rows []BatchRow) {
 // WriteBatchTable renders one row per host as an aligned summary table sorted by
 // urgency (errored hosts first, then fewest days remaining). When quiet is true,
 // healthy rows are omitted; if every row is healthy nothing is written. The
-// passed slice is sorted in place.
-func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
+// passed slice is sorted in place. Output failures are returned.
+func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) error {
+	out := &errorWriter{w: w}
+	writeBatchTable(out, rows, color, quiet)
+	if out.err != nil {
+		return fmt.Errorf("write batch: %w", out.err)
+	}
+	return nil
+}
+
+func writeBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	batchSortKey(rows)
 
 	visible := rows
@@ -446,8 +506,8 @@ func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	// failed row, instead of putting an error message under a "dead SAN count"
 	// header.
 	//
-	// Column layout is computed on the uncolored cells: tabwriter measures byte
-	// width, so a colored STATUS cell would make it count the invisible ANSI
+	// Column layout is computed on the uncolored cells: tabwriter counts
+	// code points, so a colored STATUS cell would make it count the invisible ANSI
 	// escape bytes and push the NOTE header out of alignment. The table is laid
 	// out monochrome into a buffer first, then the STATUS word on each data line
 	// is wrapped in color afterwards (color codes have zero visible width, so the
@@ -473,43 +533,37 @@ func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	}
 
 	// Colorize the laid-out table line by line. The header is line 0; each
-	// subsequent line maps in order to statuses[i]. Only the first run of the
-	// already-padded status word is recolored, so a status token appearing inside
-	// a host or note cell is never touched.
+	// subsequent line maps in order to statuses[i]. The ASCII header identifies
+	// the status column; matching by position avoids coloring a hostname or note
+	// that happens to contain the same word.
 	lines := strings.SplitAfter(plain.String(), "\n")
+	statusColumn := strings.Index(lines[0], "STATUS")
 	for i, line := range lines {
 		if i == 0 || i-1 >= len(statuses) || line == "" {
 			io.WriteString(w, line)
 			continue
 		}
 		bs := statuses[i-1]
-		io.WriteString(w, colorizeStatusCell(line, bs.status, bs.color))
+		io.WriteString(w, colorizeStatusCell(line, statusColumn, bs.status, bs.color))
 	}
 }
 
-// colorizeStatusCell wraps the first occurrence of the padded status word in
-// line with the given color. The word is matched as a whole, space-delimited
-// token (the only place a bare status word stands alone in a laid-out row) so a
-// coincidental substring in the host or note column is left untouched. Because
-// the surrounding spaces and the word's visible width are unchanged, the column
-// alignment computed by tabwriter is preserved.
-func colorizeStatusCell(line, word, color string) string {
+// colorizeStatusCell colors the known status column in a laid-out row. Columns
+// are measured in code points, as in tabwriter, so a multibyte hostname does
+// not shift the color onto a neighboring cell. Padding remains unchanged.
+func colorizeStatusCell(line string, column int, word, color string) string {
 	if word == "" || color == "" {
 		return line
 	}
-	idx := strings.Index(line, word)
-	for idx >= 0 {
-		before := idx == 0 || line[idx-1] == ' '
-		end := idx + len(word)
-		after := end >= len(line) || line[end] == ' ' || line[end] == '\n'
-		if before && after {
-			return line[:idx] + color + word + colorReset + line[end:]
+	for offset := range line {
+		if column == 0 {
+			if !strings.HasPrefix(line[offset:], word) {
+				return line
+			}
+			end := offset + len(word)
+			return line[:offset] + color + word + colorReset + line[end:]
 		}
-		next := strings.Index(line[idx+1:], word)
-		if next < 0 {
-			break
-		}
-		idx = idx + 1 + next
+		column--
 	}
 	return line
 }
@@ -570,7 +624,17 @@ func WriteBatchJSON(w io.Writer, rows []BatchRow, quiet bool) error {
 // and ports without TLS are reported alongside the certificates found. The CERT
 // column shows the leaf subject common name; the STATUS column summarizes
 // validity (VALID, EXPIRING Nd, EXPIRED, NOT YET VALID, no TLS, or closed).
-func WriteSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) {
+// Output failures are returned.
+func WriteSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) error {
+	out := &errorWriter{w: w}
+	writeSweepText(out, sr, color)
+	if out.err != nil {
+		return fmt.Errorf("write sweep: %w", out.err)
+	}
+	return nil
+}
+
+func writeSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) {
 	fmt.Fprintf(w, "%s %s\n\n", paint("tlsee sweep", colorBold, color), sanitize(sr.Host))
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)

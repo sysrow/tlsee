@@ -84,6 +84,12 @@ tlsee version
 
 `tlsee scan <target>... [flags]`
 
+Targets can be bare hosts/IPs or URLs. For URLs, only the authority's host and
+port select the endpoint; userinfo, paths, queries, and fragments do not select
+the endpoint. Malformed URL syntax, including invalid path escapes, is rejected.
+The scheme does not change the default TLS port. IPv6 interface zones remain
+part of the connection address but are excluded from certificate IP matching.
+
 | Flag          | Default | Description                                                  |
 | ------------- | ------- | ------------------------------------------------------------ |
 | `--port`      | `443`   | Port to use when the target omits one.                       |
@@ -97,11 +103,13 @@ tlsee version
 | `--no-check`  | `false` | Skip the SAN checks (resolve, TCP-probe, and confirm each name still points at the host). |
 | `--table`     | `false` | Always print the summary table, even for a single target.    |
 | `-q`, `--quiet` | `false` | Print only problems; print nothing when everything is healthy. |
-| `-f`, `--file`  | (none)  | Read targets from a file (one per line; `#` comments and blank lines ignored). |
+| `-f`, `--file`  | (none)  | Read targets from a non-empty file path (one per line; `#` comments and blank lines ignored). |
 | `--insecure`  | `false` | Always exit `0` even when the certificate has problems.      |
 
 Color is emitted only when `--color=always`, or when `--color=auto` and stdout
-is a terminal and `NO_COLOR` is unset. JSON output is never colored.
+is a terminal and `NO_COLOR` is unset. Terminal detection supports Linux, macOS,
+and Windows; other platforms require `--color=always` for color. JSON output
+is never colored.
 
 ## Batch scanning
 
@@ -112,8 +120,8 @@ scans every host concurrently and prints a summary table with one row per host:
 | -------- | ----------------------------------------------------------------- |
 | `HOST`   | The target as given.                                              |
 | `DAYS`   | Days remaining, or `ERR` when the host could not be scanned.      |
-| `STATUS` | `VALID`, `EXPIRING`, `EXPIRED`, `UNTRUSTED`, `MISMATCH`, or `ERROR`. |
-| `NOTE`   | Count of dead/stale SAN names, or the error text for failed hosts. |
+| `STATUS` | `VALID`, `EXPIRING`, `EXPIRED`, `NOT YET VALID`, `UNTRUSTED`, `MISMATCH`, or `ERROR`. |
+| `NOTE`   | Counts of dead, moved, or unprobed SAN names, or the scan error. |
 
 Rows are sorted by urgency: hosts that failed to scan first, then the fewest
 days remaining. `--json` emits a JSON array of reports, with `{host, error}`
@@ -141,7 +149,7 @@ do not use implicit TLS:
 | `pop3`     | 110           | `STLS`                             |
 | `ftp`      | 21            | `AUTH TLS`                         |
 | `postgres` | 5432          | SSLRequest                         |
-| `ldap`     | 389           | StartTLS extended request (best effort) |
+| `ldap`     | 389           | StartTLS extended request with response validation |
 
 ## Per-address certificates
 
@@ -160,11 +168,14 @@ POP3, LDAP, FTP, and PostgreSQL).
 
 | Flag        | Default | Description                                                     |
 | ----------- | ------- | --------------------------------------------------------------- |
-| `--ports`   | curated | Comma list and/or ranges, e.g. `443,8443,9000-9100`. Ports not in the curated map attempt direct TLS. |
+| `--ports`   | curated | Non-empty comma list and/or ranges, e.g. `443,8443,9000-9100`. Ports not in the curated map attempt direct TLS. |
 | `--full`    | `false` | Scan all ports `1-65535`. Slow.                                 |
 | `--timeout` | `3s`    | Per-port probe timeout, kept short so closed ports fail fast.   |
 | `--json`    | `false` | Emit JSON instead of text.                                      |
 | `--color`   | `auto`  | Color output: `auto`, `always`, or `never`.                     |
+
+`--ports` and `--full` are mutually exclusive. An explicitly empty `--ports`
+value is an error; omit the flag to use the curated defaults.
 
 Interrupting a sweep (Ctrl-C, SIGTERM) prints the ports probed so far, reports
 the number left unprobed on stderr, and exits `1`; see [Exit codes](#exit-codes).
@@ -199,6 +210,12 @@ concurrently. Dead SANs are reported but do **not** change the exit code, which
 reflects the certificate's own validity. Use `--no-check` to skip the check for
 a faster scan.
 
+At most 100 SAN names are checked per scan. Names skipped by this limit or
+interrupted by cancellation are counted in `sansNotProbed` in JSON and shown
+as not probed in full text reports and batch notes. They are not reported as
+dead or moved names. Completed checks are retained, and skipped checks do not
+change certificate health or the `--quiet` filter.
+
 ## Hygiene warnings
 
 A scan also reports informational hardening warnings derived from the
@@ -211,11 +228,13 @@ are advisory only: they do **not** change the exit code or the status headline.
 | Code | Meaning                                                                  |
 | ---- | ------------------------------------------------------------------------ |
 | `0`  | Healthy: trusted chain, hostname matches, valid, and not expiring soon. Also when help is explicitly requested (`help`, `-h`, `--help`), which is written to stdout. |
-| `1`  | Runtime error: bad flags, missing target, unknown command, connection failure, or a sweep interrupted before every port was probed. |
+| `1`  | Runtime error: bad flags, missing target, unknown command, connection or output failure, or a sweep interrupted before every port was probed. |
 | `2`  | Usage shown for no arguments, or a certificate problem: expired, not yet valid, untrusted, hostname mismatch, or expiring within `--warn-days`. A certificate problem is suppressed by `--insecure`. |
 
-With `--insecure`, the certificate is still retrieved and printed; only the
-exit code is forced to `0`.
+With `--insecure`, the certificate is still retrieved and printed; certificate
+problems no longer affect the exit code. Connection and output failures
+still exit `1`. An output failure takes precedence over per-host codes, including
+when help or version output cannot be written.
 
 In batch mode the exit code is the worst per-host code: `2` if any certificate
 has a problem, `1` if any host failed to scan, otherwise `0`. The `sweep`

@@ -53,7 +53,7 @@ var errNoTargets = errors.New("at least one target is required")
 // Exit codes returned by Run.
 const (
 	exitOK       = 0 // healthy certificate, or explicitly requested help (or a problem suppressed by --insecure)
-	exitError    = 1 // runtime error: bad flags, missing/extra args, unknown command, connection failure
+	exitError    = 1 // runtime error: bad flags, missing/extra args, unknown command, connection or output failure
 	exitCertProb = 2 // certificate problem, or usage shown for no-args
 	// exitUsage (no-args usage) intentionally shares exitCertProb's value;
 	// defining it in terms of exitCertProb keeps them from silently diverging.
@@ -75,13 +75,11 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "sweep":
 		return runSweep(args[1:], stdout, stderr)
 	case "version":
-		fmt.Fprintf(stdout, "tlsee %s\n", toolVersion())
-		return exitOK
+		return exitCodeForOutput(writeOutput(stdout, fmt.Sprintf("tlsee %s\n", toolVersion())), stderr)
 	case "help", "-h", "--help":
 		// Help was explicitly requested, so it is the requested output:
 		// write to stdout and succeed, keeping the tool pipeable.
-		writeUsage(stdout)
-		return exitOK
+		return exitCodeForOutput(writeUsage(stdout), stderr)
 	default:
 		fmt.Fprintf(stderr, "tlsee: unknown command %q\n\n", args[0])
 		writeUsage(stderr)
@@ -110,7 +108,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		allIPs    = fs.Bool("all-ips", false, "connect to every resolved A/AAAA address and compare certificates")
 		table     = fs.Bool("table", false, "always print the summary table, even for a single target")
 		quiet     = fs.Bool("quiet", false, "print only problems; print nothing when everything is healthy")
-		file      = fs.String("file", "", "read targets from a file (one per line; # comments and blanks ignored)")
+		file      = fs.String("file", "", "read targets from a non-empty file path (one per line; # comments and blanks ignored)")
 	)
 	fs.StringVar(file, "f", "", "shorthand for --file")
 	fs.BoolVar(quiet, "q", false, "shorthand for --quiet")
@@ -126,11 +124,15 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		// to stdout and succeed (and "scan host -- --help" treats --help as a
 		// literal target rather than a help request).
 		if errors.Is(err, flag.ErrHelp) {
-			printScanUsage(stdout, fs)
-			return exitOK
+			return exitCodeForOutput(printScanUsage(stdout, fs), stderr)
 		}
 		// A real flag-parse error was already printed to stderr by flag.
 		printScanUsage(stderr, fs)
+		return exitError
+	}
+
+	if *file == "" && flagProvided(fs, "file", "f") {
+		fmt.Fprintln(stderr, "tlsee scan: --file requires a non-empty path")
 		return exitError
 	}
 
@@ -205,7 +207,10 @@ func scanSingle(ctx context.Context, stdout, stderr io.Writer, target string, op
 			return exitError
 		}
 	} else {
-		report.WriteText(stdout, rep, useColor)
+		if err := report.WriteText(stdout, rep, useColor); err != nil {
+			fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
+			return exitError
+		}
 	}
 
 	if insecure {
@@ -234,7 +239,10 @@ func scanBatch(ctx context.Context, stdout, stderr io.Writer, targets []string, 
 			return exitError
 		}
 	} else {
-		report.WriteBatchTable(stdout, rows, useColor, quiet)
+		if err := report.WriteBatchTable(stdout, rows, useColor, quiet); err != nil {
+			fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
+			return exitError
+		}
 	}
 
 	if insecure {
@@ -314,19 +322,34 @@ func worstExitCode(rows []report.BatchRow) int {
 // may instead come from a host file).
 //
 // A "--" end-of-flags terminator is honored once, at the top level: everything
-// after the first "--" is treated as positional verbatim and never re-parsed as
-// flags. The stdlib flag package only honors "--" within a single Parse call,
+// after a standalone "--" is treated as positional verbatim and never re-parsed
+// as flags. A non-boolean flag can consume "--" as its value instead. The stdlib
+// flag package only honors "--" within a single Parse call,
 // so without this the terminator would lose effect on the loop's later
 // iterations. Splitting here keeps standard Unix flag semantics for both the
 // scan and sweep subcommands, which share this function.
 func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	rest := args
 	var trailing []string
-	for i, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--" {
 			rest = args[:i]
 			trailing = args[i+1:]
 			break
+		}
+		if len(a) < 2 || a[0] != '-' {
+			continue
+		}
+		name := strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-")
+		if strings.Contains(name, "=") {
+			continue // The value is already in the flag argument.
+		}
+		if f := fs.Lookup(name); f != nil {
+			boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+			if !ok || !boolFlag.IsBoolFlag() {
+				i++ // Skip the required value, even when it is "--".
+			}
 		}
 	}
 
@@ -343,6 +366,20 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	}
 	targets = append(targets, trailing...)
 	return targets, nil
+}
+
+// flagProvided distinguishes an omitted optional flag from an explicitly empty
+// value. Aliases can share a destination while retaining separate visited names.
+func flagProvided(fs *flag.FlagSet, names ...string) bool {
+	provided := false
+	fs.Visit(func(f *flag.Flag) {
+		for _, name := range names {
+			if f.Name == name {
+				provided = true
+			}
+		}
+	})
+	return provided
 }
 
 // readHostFile opens path and parses its target lines. It wraps the errors
@@ -389,7 +426,7 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	var (
-		ports     = fs.String("ports", "", "ports to scan: comma list and/or ranges, e.g. 443,8443,9000-9100 (default: curated list)")
+		ports     = fs.String("ports", "", "ports to scan: non-empty comma list and/or ranges, e.g. 443,8443,9000-9100 (default: curated list)")
 		full      = fs.Bool("full", false, "scan all ports 1-65535 (slow)")
 		timeout   = fs.Duration("timeout", 3*time.Second, "per-port probe timeout")
 		asJSON    = fs.Bool("json", false, "emit JSON instead of text")
@@ -402,8 +439,7 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	hosts, err := parseInterspersed(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			printSweepUsage(stdout, fs)
-			return exitOK
+			return exitCodeForOutput(printSweepUsage(stdout, fs), stderr)
 		}
 		printSweepUsage(stderr, fs)
 		return exitError
@@ -415,7 +451,8 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	}
 	host := hosts[0]
 
-	if *ports != "" && *full {
+	portsProvided := flagProvided(fs, "ports")
+	if portsProvided && *full {
 		fmt.Fprintln(stderr, "tlsee sweep: --ports and --full are mutually exclusive")
 		return exitError
 	}
@@ -431,7 +468,7 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	case *full:
 		opts.Ports = fullPortRange()
 		opts.Concurrency = 256
-	case *ports != "":
+	case portsProvided:
 		list, err := tlsscan.ParsePortSpec(*ports)
 		if err != nil {
 			fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
@@ -466,7 +503,10 @@ func writeSweepResult(sr *tlsscan.SweepResult, stdout, stderr io.Writer, asJSON,
 			return exitError
 		}
 	} else {
-		report.WriteSweepText(stdout, sr, useColor)
+		if err := report.WriteSweepText(stdout, sr, useColor); err != nil {
+			fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
+			return exitError
+		}
 	}
 	if sr.PortsNotProbed > 0 {
 		total := len(sr.Ports) + sr.PortsNotProbed
@@ -530,47 +570,65 @@ func resolveColor(mode string, stdout io.Writer) (bool, error) {
 	}
 }
 
-// isTerminal reports whether w is a character device (a terminal).
-func isTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
+// writeOutput writes already rendered help or version output and detects an
+// incomplete write even when the supplied writer fails to return an error.
+func writeOutput(w io.Writer, text string) error {
+	n, err := io.WriteString(w, text)
+	if err == nil && n != len(text) {
+		err = io.ErrShortWrite
 	}
-	info, err := f.Stat()
+	return err
+}
+
+// exitCodeForOutput handles requested stdout output. Failure to write the
+// diagnostic to stderr cannot turn a failed command into a successful one.
+func exitCodeForOutput(err error, stderr io.Writer) int {
 	if err != nil {
-		return false
+		fmt.Fprintf(stderr, "tlsee: write output: %v\n", err)
+		return exitError
 	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return exitOK
 }
 
 // printScanUsage writes the scan subcommand usage and flag list to w.
-func printScanUsage(w io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintln(w, "Usage: tlsee scan <target>... [flags]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "One or more targets, and/or -f/--file with one target per line.")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Flags:")
-	fs.SetOutput(w)
+func printScanUsage(w io.Writer, fs *flag.FlagSet) error {
+	var text strings.Builder
+	fmt.Fprintln(&text, "Usage: tlsee scan <target>... [flags]")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "One or more targets, and/or -f/--file with one target per line.")
+	fmt.Fprintln(&text, "Connection or output failures exit 1, even with --insecure.")
+	fmt.Fprintln(&text, "SAN checks skipped by the limit or cancellation are reported separately.")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "Flags:")
+	previousOutput := fs.Output()
+	fs.SetOutput(&text)
 	fs.PrintDefaults()
+	fs.SetOutput(previousOutput)
+	return writeOutput(w, text.String())
 }
 
 // printSweepUsage writes the sweep subcommand usage and flag list to w.
-func printSweepUsage(w io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintln(w, "Usage: tlsee sweep <host> [flags]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Probe many ports of one host for TLS and report each certificate.")
-	fmt.Fprintln(w, "By default a curated list of well-known TLS and STARTTLS ports is scanned.")
-	fmt.Fprintln(w, "--full scans all 65535 ports and is slow.")
-	fmt.Fprintln(w, "An interrupted sweep (Ctrl-C, SIGTERM) prints the ports probed so far and exits 1.")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Flags:")
-	fs.SetOutput(w)
+func printSweepUsage(w io.Writer, fs *flag.FlagSet) error {
+	var text strings.Builder
+	fmt.Fprintln(&text, "Usage: tlsee sweep <host> [flags]")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "Probe many ports of one host for TLS and report each certificate.")
+	fmt.Fprintln(&text, "By default a curated list of well-known TLS and STARTTLS ports is scanned.")
+	fmt.Fprintln(&text, "--full scans all 65535 ports and is slow.")
+	fmt.Fprintln(&text, "An interrupted sweep (Ctrl-C, SIGTERM) prints the ports probed so far and exits 1.")
+	fmt.Fprintln(&text, "Output failures also exit 1.")
+	fmt.Fprintln(&text)
+	fmt.Fprintln(&text, "Flags:")
+	previousOutput := fs.Output()
+	fs.SetOutput(&text)
 	fs.PrintDefaults()
+	fs.SetOutput(previousOutput)
+	return writeOutput(w, text.String())
 }
 
 // writeUsage prints top-level usage and exit-code documentation to w.
-func writeUsage(w io.Writer) {
-	fmt.Fprint(w, `tlsee - a friendly TLS certificate inspector
+func writeUsage(w io.Writer) error {
+	return writeOutput(w, `tlsee - a friendly TLS certificate inspector
 
 Usage:
   tlsee scan <target>... [flags]   Inspect the TLS certificate(s) at one or more targets
@@ -602,7 +660,7 @@ Scan flags:
   --no-check          skip SAN liveness checks (on by default)
   --table             always print the summary table, even for one target
   -q, --quiet         print only problems; print nothing when all healthy
-  -f, --file PATH     read targets from a file (one per line; # comments ignored)
+  -f, --file PATH     read targets from a non-empty file path (# comments ignored)
   --insecure          always exit 0 even when the certificate has problems
 
 With more than one target, or with --table, tlsee scans every target
@@ -618,7 +676,7 @@ emits a single JSON object. Scripts that parse single-host JSON should account
 for this shape difference.
 
 Sweep flags:
-  --ports SPEC        comma list and/or ranges, e.g. 443,8443,9000-9100
+  --ports SPEC        non-empty comma list/ranges, e.g. 443,8443,9000-9100
   --full              scan all ports 1-65535 (slow)
   --timeout 3s        per-port probe timeout (default 3s)
   --json              emit JSON instead of text
@@ -630,19 +688,22 @@ longer resolves, or whose host is unreachable on the port). A name that
 resolves away from the scanned host is confirmed with one further handshake
 and reported as "elsewhere" when another certificate is served there. Dead and
 moved SANs are shown but do not change the exit code, which reflects the
-certificate's own validity. Use --no-check to skip this.
+certificate's own validity. Names skipped by the check limit or cancellation
+are reported as not probed. Use --no-check to skip these checks.
 
 Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon
      (also when help is explicitly requested)
   1  runtime error: bad flags, missing target, unknown command,
-     connection failure, or a sweep interrupted before every port was
-     probed
+     connection or output failure, or a sweep interrupted before
+     every port was probed
   2  usage shown for no arguments, or a certificate problem: expired, not
      yet valid, untrusted, hostname mismatch, or expiring within --warn-days
      (a certificate problem is suppressed by --insecure)
 
 In batch mode the exit code is the worst per-host code: 2 if any certificate
-has a problem, 1 if any host failed to scan, else 0.
+has a problem, 1 if any host failed to scan, else 0. Output failures
+exit 1 regardless of per-host codes. --insecure does not suppress connection
+or output failures.
 `)
 }

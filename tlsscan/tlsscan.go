@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -168,7 +169,7 @@ type Report struct {
 	SANsElsewhere int `json:"sansElsewhere"`
 	// SANsNotProbed is the number of SAN names skipped by the liveness check,
 	// either because the certificate exceeded maxSANChecks names or because
-	// the scan was canceled before they were probed.
+	// the scan was canceled before their checks completed.
 	SANsNotProbed int `json:"sansNotProbed,omitempty"`
 	// Warnings holds informational hygiene findings (weak TLS version, weak
 	// signature algorithm, weak RSA key, or a weak negotiated cipher suite).
@@ -204,7 +205,7 @@ var lookupIP = net.DefaultResolver.LookupIP
 // SweepOptions controls a multi-port sweep of a single host.
 type SweepOptions struct {
 	// Ports is the explicit list of ports to probe. When empty, the curated
-	// default port table is used.
+	// default port table is used. Each port must be in the range 1-65535.
 	Ports []int
 	// Timeout bounds each per-port probe (TCP connect plus any STARTTLS and
 	// handshake). Defaults to defaultSweepTimeout so closed ports fail fast.
@@ -282,12 +283,9 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 	}
 	warnDays := defaultWarnDays
 
-	// Bound the entire scan (connect + STARTTLS + handshake + DNS + SAN/AllIPs
-	// probes) by a single timeout budget, mirroring how the sweep engine wraps
-	// one per-port context. The per-call timeout argument is kept as the dialer
-	// and handshake deadline; threading scanCtx as the base makes the nested
-	// per-phase contexts take the min of the two, so the whole scan cannot exceed
-	// --timeout no matter how many phases run.
+	// Bound connect + STARTTLS + handshake by a single timeout budget. Each
+	// phase inherits the remaining budget through scanCtx; post-handshake
+	// enrichment runs separately on the caller's context with its own timeouts.
 	scanCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -318,6 +316,10 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 
 	state := tlsConn.ConnectionState()
 	elapsed := time.Since(start).Milliseconds()
+	// All remaining work uses the captured certificate state. Release the
+	// primary socket before potentially slow DNS and SAN/per-IP enrichment;
+	// the deferred close above still covers early negotiation failures.
+	conn.Close()
 
 	if len(state.PeerCertificates) == 0 {
 		return nil, fmt.Errorf("connect %s: server presented no certificates", addr)
@@ -356,20 +358,21 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 		report.ChainTrusted = true
 	}
 
-	// Hostname matching is independent of trust. VerifyHostname also
-	// handles IP SANs, so the parsed host is passed directly.
-	report.HostnameMatch = leaf.VerifyHostname(host) == nil
+	// Hostname matching is independent of trust. An IPv6 zone selects a local
+	// network interface; it is not part of the certificate's IP identity.
+	identity, isIP := hostIdentity(host)
+	report.HostnameMatch = leaf.VerifyHostname(identity) == nil
 
 	// DNS resolution is best-effort and skipped for IP literals. It is
 	// bounded by its own timeout-derived context so a slow resolver cannot
-	// make the scan exceed --timeout.
+	// hold up enrichment indefinitely.
 	// Post-handshake enrichment (DNS resolution, SAN liveness, per-IP probing)
 	// runs on the original ctx, NOT scanCtx. scanCtx's single --timeout budget
 	// is depleted by the connect and handshake; reusing it here would give the
 	// enrichment little or no time and, worse, make checkSANs/probeIPCerts trip
 	// their cancellation path and report un-probed names as dead. These steps
 	// carry their own per-probe timeouts and still honor ctx cancellation.
-	if opts.ResolveDNS && net.ParseIP(host) == nil {
+	if opts.ResolveDNS && !isIP {
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, timeout)
 		defer lookupCancel()
 		if ips, lookupErr := net.DefaultResolver.LookupHost(lookupCtx, host); lookupErr == nil {
@@ -406,7 +409,7 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 	// Per-IP certificates: connect to every resolved address (SNI=host) to
 	// detect backends serving a stale or mismatched certificate. Skipped for IP
 	// literals; only meaningful when more than one address resolves.
-	if opts.AllIPs && net.ParseIP(host) == nil {
+	if opts.AllIPs && !isIP {
 		report.IPCerts, report.IPCertsDiffer = probeIPCerts(ctx, host, port, sni, opts.StartTLS, report.ResolvedIPs, probeTimeout(timeout))
 	}
 
@@ -464,9 +467,15 @@ func checkSANs(ctx context.Context, names []string, port string, timeout time.Du
 		names = names[:maxSANChecks]
 	}
 	checks = make([]SANCheck, len(names))
+	completed := make([]bool, len(names))
 	sem := make(chan struct{}, sanProbeConcurrency)
 	var wg sync.WaitGroup
+	dispatched := 0
+dispatch:
 	for i, name := range names {
+		if ctx.Err() != nil {
+			break
+		}
 		// Acquire a slot, but stop dispatching promptly on cancellation
 		// (Ctrl-C/SIGTERM) instead of launching every remaining probe. Names
 		// never dispatched are counted as not probed rather than left as
@@ -474,44 +483,61 @@ func checkSANs(ctx context.Context, names []string, port string, timeout time.Du
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			// Truncate only after the in-flight probes finish: the spawned
-			// goroutines read the checks slice header through their closure, so
-			// reassigning it before Wait would race with them.
-			notProbed += len(names) - i
-			wg.Wait()
-			return checks[:i], notProbed
+			break dispatch
 		}
+		dispatched++
 		wg.Add(1)
 		go func(i int, name string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			checks[i] = checkSAN(ctx, name, port, timeout, sctx)
+			checks[i], completed[i] = checkSAN(ctx, name, port, timeout, sctx)
 		}(i, name)
 	}
 	wg.Wait()
+	// Compact only after every worker finishes writing its slot. Both checks
+	// never started and checks interrupted in flight count as not probed.
+	probed := checks[:0]
+	for i := 0; i < dispatched; i++ {
+		if completed[i] {
+			probed = append(probed, checks[i])
+		}
+	}
+	notProbed += len(names) - len(probed)
+	checks = probed
 	return checks, notProbed
 }
 
 // checkSAN resolves a single SAN name and TCP-probes each resolved address.
 // Wildcard names (for example "*.example.com") cannot be resolved as-is, so
 // they are reported but not probed.
-func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sctx sanContext) SANCheck {
+// The second result reports whether the check completed. Caller cancellation
+// leaves no verdict; a per-probe timeout still counts as a completed check.
+func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sctx sanContext) (SANCheck, bool) {
 	sc := SANCheck{Name: name}
+	if ctx.Err() != nil {
+		return sc, false
+	}
 	if strings.HasPrefix(name, "*.") {
 		sc.Wildcard = true
-		return sc
+		return sc, true
 	}
 
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ips, err := lookupIP(lookupCtx, "ip", name)
 	if err != nil || len(ips) == 0 {
-		return sc // Resolved stays false.
+		return sc, ctx.Err() == nil // Resolved stays false.
 	}
 	sc.Resolved = true
 
 	for _, ip := range ips {
+		if ctx.Err() != nil {
+			return sc, false
+		}
 		ok, probeErr := probeAddr(ctx, ip.String(), port, timeout)
+		if !ok && ctx.Err() != nil {
+			return sc, false
+		}
 		ac := AddrCheck{IP: ip.String(), Reachable: ok}
 		if !ok && probeErr != nil {
 			ac.Error = probeErr.Error()
@@ -527,8 +553,11 @@ func checkSAN(ctx context.Context, name, port string, timeout time.Duration, sct
 	// further diagnosis.
 	if sc.Resolved && sc.Reachable {
 		sc.Ownership = classifyOwnership(ctx, sc.Addrs, name, port, timeout, sctx)
+		if sc.Ownership == OwnershipUnverified && ctx.Err() != nil {
+			return sc, false
+		}
 	}
-	return sc
+	return sc, true
 }
 
 // hostAddrSet builds the set of addresses belonging to the scanned host, used
@@ -712,13 +741,16 @@ func probeIPCerts(ctx context.Context, host, port, sni, proto string, resolved [
 // probeIPCert connects to a single resolved address, presenting sni, and
 // retrieves its leaf certificate. proto is the STARTTLS mechanism negotiated
 // before the handshake ("" for direct TLS), mirroring Scan's main path so
-// --all-ips works for STARTTLS services. Any failure is captured in
-// IPCert.Error.
+// --all-ips works for STARTTLS services. Timeout bounds the entire connection,
+// STARTTLS negotiation, and TLS handshake. Any failure is captured in IPCert.Error.
 func probeIPCert(ctx context.Context, ip, port, sni, proto string, timeout time.Duration) IPCert {
 	res := IPCert{IP: ip}
 	addr := net.JoinHostPort(ip, port)
 
-	conn, err := dialPlaintext(ctx, addr, timeout)
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, err := dialPlaintext(probeCtx, addr, timeout)
 	if err != nil {
 		res.Error = err.Error()
 		return res
@@ -726,13 +758,13 @@ func probeIPCert(ctx context.Context, ip, port, sni, proto string, timeout time.
 	defer conn.Close()
 
 	if proto != "" {
-		if err := startTLSNegotiate(ctx, conn, proto, timeout); err != nil {
+		if err := startTLSNegotiate(probeCtx, conn, proto, timeout); err != nil {
 			res.Error = err.Error()
 			return res
 		}
 	}
 
-	tlsConn, err := tlsHandshake(ctx, conn, sni, timeout)
+	tlsConn, err := tlsHandshake(probeCtx, conn, sni, timeout)
 	if err != nil {
 		res.Error = err.Error()
 		return res
@@ -776,8 +808,19 @@ func ipCertsDiffer(certs []IPCert) bool {
 	return false
 }
 
+// hostIdentity returns the name or IP identity to verify against a certificate.
+// IPv6 zones are routing information and must not become part of an IP SAN
+// comparison. The second result also identifies zoned literals as IP addresses
+// so the caller does not attempt DNS enrichment for them.
+func hostIdentity(host string) (string, bool) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.WithZone("").String(), true
+	}
+	return host, false
+}
+
 // parseTarget splits a target into host and port. It strips a leading
-// scheme and any trailing path or query, then splits the host and port.
+// scheme and any trailing path, query, or fragment, then splits the host and port.
 // When no port is present, defaultPortOverride (or 443) is used. IPv6
 // literals such as "[::1]:8443" and "[::1]" are handled.
 func parseTarget(target, defaultPortOverride string) (host, port string, err error) {
@@ -794,23 +837,27 @@ func parseTarget(target, defaultPortOverride string) (host, port string, err err
 		return "", "", fmt.Errorf("parse target: empty target")
 	}
 
-	// Strip a leading scheme such as "https://" or "tls://".
-	if i := strings.Index(remainder, "://"); i >= 0 {
-		remainder = remainder[i+len("://"):]
-	}
-
-	// Strip any trailing path or query. For an IPv6 literal the host is
-	// inside brackets, so only look past the closing bracket.
-	cut := remainder
-	if strings.HasPrefix(remainder, "[") {
-		if end := strings.IndexByte(remainder, ']'); end >= 0 {
-			cut = remainder[end:]
-			if slash := strings.IndexAny(cut, "/?"); slash >= 0 {
-				remainder = remainder[:end] + cut[:slash]
+	// Use URL authority parsing for a leading scheme: userinfo is not part of
+	// the dial host, and IPv6 URL zones need percent decoding. A scheme inside
+	// a bare target's path, query, or fragment must not replace its host.
+	if i := strings.Index(remainder, "://"); i >= 0 && !strings.ContainsAny(remainder[:i], "/?#") {
+		parsed, parseErr := url.Parse(remainder)
+		if parseErr != nil {
+			return "", "", fmt.Errorf("parse target %q: %w", target, parseErr)
+		}
+		remainder = parsed.Host
+	} else {
+		// Brackets delimit an IPv6 literal, whose routing zone can contain
+		// characters that would otherwise begin a URL suffix.
+		suffixStart := 0
+		if strings.HasPrefix(remainder, "[") {
+			if end := strings.IndexByte(remainder, ']'); end >= 0 {
+				suffixStart = end + 1
 			}
 		}
-	} else if slash := strings.IndexAny(remainder, "/?"); slash >= 0 {
-		remainder = remainder[:slash]
+		if end := strings.IndexAny(remainder[suffixStart:], "/?#"); end >= 0 {
+			remainder = remainder[:suffixStart+end]
+		}
 	}
 
 	if remainder == "" {
@@ -824,10 +871,18 @@ func parseTarget(target, defaultPortOverride string) (host, port string, err err
 		// like "::1" or "2001:db8::1", for which SplitHostPort instead reports
 		// "too many colons in address".
 		bare := strings.TrimSuffix(strings.TrimPrefix(remainder, "["), "]")
-		if net.ParseIP(bare) != nil || strings.Contains(splitErr.Error(), "missing port in address") {
+		_, ipErr := netip.ParseAddr(bare)
+		if ipErr == nil || strings.Contains(splitErr.Error(), "missing port in address") {
+			if strings.TrimSpace(bare) == "" {
+				return "", "", fmt.Errorf("parse target %q: no host", target)
+			}
 			return bare, port, nil
 		}
 		return "", "", fmt.Errorf("parse target %q: %w", target, splitErr)
+	}
+
+	if strings.TrimSpace(h) == "" {
+		return "", "", fmt.Errorf("parse target %q: no host", target)
 	}
 
 	if p != "" {
@@ -858,7 +913,7 @@ func certInfo(c *x509.Certificate, now time.Time) CertInfo {
 		SerialNumber:       c.SerialNumber.String(),
 		NotBefore:          c.NotBefore,
 		NotAfter:           c.NotAfter,
-		DaysRemaining:      int(c.NotAfter.Sub(now).Hours() / 24),
+		DaysRemaining:      wholeDaysRemaining(c.NotAfter, now),
 		Expired:            now.After(c.NotAfter),
 		NotYetValid:        now.Before(c.NotBefore),
 		DNSNames:           c.DNSNames,
@@ -868,6 +923,21 @@ func certInfo(c *x509.Certificate, now time.Time) CertInfo {
 		PublicKeyAlgorithm: c.PublicKeyAlgorithm.String(),
 		FingerprintSHA256:  formatFingerprint(sum[:]),
 	}
+}
+
+// wholeDaysRemaining counts full 24-hour periods, truncating toward zero.
+// Certificate dates can exceed time.Duration's roughly 292-year range, so
+// time.Time.Sub would clamp the result. Unix seconds cover the certificate
+// date range; the nanosecond adjustment preserves partial-day boundaries.
+func wholeDaysRemaining(expires, now time.Time) int {
+	seconds := expires.Unix() - now.Unix()
+	nanos := expires.Nanosecond() - now.Nanosecond()
+	if seconds > 0 && nanos < 0 {
+		seconds--
+	} else if seconds < 0 && nanos > 0 {
+		seconds++
+	}
+	return int(seconds / (24 * 60 * 60))
 }
 
 // keyBits returns the size of a public key in bits: the modulus length for RSA,

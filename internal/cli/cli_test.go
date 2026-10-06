@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"io"
 	"os"
@@ -60,6 +61,91 @@ func TestParseInterspersed(t *testing.T) {
 			}
 			if *asJSON != tc.wantJSON {
 				t.Errorf("json = %v; want %v", *asJSON, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestParseInterspersedValueBoundaries distinguishes a terminator from a value
+// consumed by a non-boolean flag. The standard parser remains responsible for
+// validating values and producing help and error diagnostics.
+func TestParseInterspersedValueBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantTargets []string
+		wantFile    string
+		wantJSON    bool
+	}{
+		{"double dash value", []string{"--file", "--", "host", "--json"}, []string{"host"}, "--", true},
+		{"single dash flag", []string{"-file", "--", "host"}, []string{"host"}, "--", false},
+		{"short alias", []string{"host", "-f", "--", "--json"}, []string{"host"}, "--", true},
+		{"value between targets", []string{"first", "--file", "--", "second", "--json"}, []string{"first", "second"}, "--", true},
+		{"value before terminator", []string{"--file", "--", "--", "--json", "--help", "--"}, []string{"--json", "--help", "--"}, "--", false},
+		{"inline value", []string{"--file=--", "--", "--json"}, []string{"--json"}, "--", false},
+		{"empty inline value", []string{"--file=", "--", "--json"}, []string{"--json"}, "", false},
+		{"empty separate value", []string{"--file", "", "--json", "host"}, []string{"host"}, "", true},
+		{"help as value", []string{"--file", "--help", "host"}, []string{"host"}, "--help", false},
+		{"flag as value", []string{"--file", "--json", "host"}, []string{"host"}, "--json", false},
+		{"single dash value", []string{"--file", "-", "host"}, []string{"host"}, "-", false},
+		{"boolean before terminator", []string{"--json", "--", "--file", "--help"}, []string{"--file", "--help"}, "", true},
+		{"explicit boolean before terminator", []string{"--json=false", "--", "--file"}, []string{"--file"}, "", false},
+		{"boolean separate false is positional", []string{"--json", "false", "--file", "--"}, []string{"false"}, "--", true},
+		{"terminator at end", []string{"host", "--"}, []string{"host"}, "", false},
+		{"single dash positional", []string{"-", "--file", "--"}, []string{"-"}, "--", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			file := fs.String("file", "", "")
+			fs.StringVar(file, "f", "", "")
+			asJSON := fs.Bool("json", false, "")
+			targets, err := parseInterspersed(fs, tc.args)
+			if err != nil {
+				t.Fatalf("parseInterspersed(%q): %v", tc.args, err)
+			}
+			if !equalStrings(targets, tc.wantTargets) || *file != tc.wantFile || *asJSON != tc.wantJSON {
+				t.Errorf("got targets=%q file=%q json=%t; want targets=%q file=%q json=%t", targets, *file, *asJSON, tc.wantTargets, tc.wantFile, tc.wantJSON)
+			}
+		})
+	}
+}
+
+func TestParseInterspersedStandardDiagnostics(t *testing.T) {
+	for _, args := range [][]string{
+		{"--file"},
+		{"--json", "--file"},
+		{"--count", "--"},
+		{"--json=--"},
+		{"--unknown", "--"},
+		{"---file", "--"},
+		{"--file", "--", "--help"},
+		{"--file", "--", "--h"},
+		{"--file", "--", "-help"},
+		{"--file", "--", "-h"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			newFlags := func(output io.Writer) *flag.FlagSet {
+				fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+				fs.SetOutput(output)
+				fs.String("file", "", "")
+				fs.Bool("json", false, "")
+				fs.Int("count", 0, "")
+				return fs
+			}
+			var standardOutput, output bytes.Buffer
+			wantErr := newFlags(&standardOutput).Parse(args)
+			if wantErr == nil {
+				t.Fatal("expected standard parser error or help")
+			}
+			// A preceding positional must not alter a flag's diagnostics.
+			_, err := parseInterspersed(newFlags(&output), append([]string{"host"}, args...))
+			if err == nil || err.Error() != wantErr.Error() || errors.Is(err, flag.ErrHelp) != errors.Is(wantErr, flag.ErrHelp) {
+				t.Errorf("error = %v; want %v", err, wantErr)
+			}
+			if output.String() != standardOutput.String() {
+				t.Errorf("diagnostics = %q; want %q", output.String(), standardOutput.String())
 			}
 		})
 	}
@@ -233,6 +319,32 @@ func TestRunDispatch(t *testing.T) {
 			wantStdoutOnly: true,
 		},
 		{
+			name:           "scan help after double dash value",
+			args:           []string{"scan", "host", "--file", "--", "--help"},
+			wantCode:       exitOK,
+			wantStdoutHas:  "Usage: tlsee scan",
+			wantStdoutOnly: true,
+		},
+		{
+			name:           "sweep help after double dash value",
+			args:           []string{"sweep", "host", "--ports", "--", "--help"},
+			wantCode:       exitOK,
+			wantStdoutHas:  "Usage: tlsee sweep",
+			wantStdoutOnly: true,
+		},
+		{
+			name:          "scan validates double dash color value",
+			args:          []string{"scan", "host", "--color", "--"},
+			wantCode:      exitError,
+			wantStderrHas: "invalid --color value",
+		},
+		{
+			name:          "sweep validates double dash color value",
+			args:          []string{"sweep", "host", "--color", "--"},
+			wantCode:      exitError,
+			wantStderrHas: "invalid --color value",
+		},
+		{
 			name:          "scan invalid --starttls rejected up front exit 1",
 			args:          []string{"scan", "example.com", "--starttls", "bogus"},
 			wantCode:      exitError,
@@ -275,5 +387,138 @@ func TestRunDispatch(t *testing.T) {
 				t.Errorf("expected empty stderr, got:\n%s", stderr.String())
 			}
 		})
+	}
+}
+
+// requestedOutputWriter fails at a byte boundary, allowing the tests to cover
+// both immediately rejected output and partially written help or version text.
+type requestedOutputWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *requestedOutputWriter) Write(p []byte) (int, error) {
+	if len(p) <= w.remaining {
+		w.remaining -= len(p)
+		return len(p), nil
+	}
+	n := w.remaining
+	w.remaining = 0
+	return n, w.err
+}
+
+func TestRequestedOutputFailure(t *testing.T) {
+	outputErr := errors.New("output unavailable")
+	for _, args := range [][]string{
+		{"version"}, {"help"}, {"-h"}, {"--help"},
+		{"scan", "--help"}, {"scan", "host", "-h"},
+		{"sweep", "--help"}, {"sweep", "host", "-help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var successfulOutput, stderr bytes.Buffer
+			if code := Run(args, &successfulOutput, &stderr); code != exitOK || stderr.Len() != 0 {
+				t.Fatalf("successful output returned %d, stderr %q", code, stderr.String())
+			}
+			for _, limit := range []int{0, successfulOutput.Len() / 2, successfulOutput.Len() - 1} {
+				for _, failure := range []error{outputErr, nil} {
+					stderr.Reset()
+					stdout := &requestedOutputWriter{remaining: limit, err: failure}
+					if code := Run(args, stdout, &stderr); code != exitError {
+						t.Errorf("limit %d: exit = %d; want %d", limit, code, exitError)
+					}
+					wantErr := failure
+					if wantErr == nil {
+						wantErr = io.ErrShortWrite
+					}
+					if !strings.Contains(stderr.String(), wantErr.Error()) {
+						t.Errorf("limit %d: stderr = %q; want %q", limit, stderr.String(), wantErr)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDiagnosticOutputFailurePreservesExit(t *testing.T) {
+	failure := outputErrorWriter{errors.New("output unavailable")}
+	for _, args := range [][]string{{"help"}, {"version"}, {"scan", "--help"}, {"sweep", "--help"}} {
+		var stdout bytes.Buffer
+		if code := Run(args, &stdout, failure); code != exitOK {
+			t.Errorf("Run(%q) = %d; successful stdout must not depend on unused stderr", args, code)
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{nil, exitUsage},
+		{[]string{"unknown"}, exitError},
+		{[]string{"scan"}, exitError},
+		{[]string{"scan", "--unknown"}, exitError},
+		{[]string{"sweep"}, exitError},
+		{[]string{"sweep", "--unknown"}, exitError},
+		{[]string{"help"}, exitError},
+		{[]string{"version"}, exitError},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			if code := Run(tc.args, failure, failure); code != tc.want {
+				t.Errorf("exit = %d; want %d", code, tc.want)
+			}
+		})
+	}
+}
+
+func TestExplicitEmptyInputFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"file value", []string{"scan", "", "--file", ""}, "--file requires a non-empty path"},
+		{"file inline", []string{"scan", "", "--file="}, "--file requires a non-empty path"},
+		{"file alias", []string{"scan", "", "-f", ""}, "--file requires a non-empty path"},
+		{"file alias inline", []string{"scan", "", "-f="}, "--file requires a non-empty path"},
+		{"file without positional", []string{"scan", "--file="}, "--file requires a non-empty path"},
+		{"file overwritten", []string{"scan", "", "--file", "hosts.txt", "-f="}, "--file requires a non-empty path"},
+		{"ports value", []string{"sweep", "", "--ports", ""}, "parse ports: empty spec"},
+		{"ports inline", []string{"sweep", "", "--ports="}, "parse ports: empty spec"},
+		{"ports overwritten", []string{"sweep", "", "--ports", "443", "--ports="}, "parse ports: empty spec"},
+		{"empty ports conflict with full", []string{"sweep", "", "--ports=", "--full"}, "--ports and --full are mutually exclusive"},
+		{"empty ports with false full", []string{"sweep", "", "--ports=", "--full=false"}, "parse ports: empty spec"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// An empty target guarantees even the unfixed path cannot dial.
+			var stdout, stderr bytes.Buffer
+			if code := Run(tc.args, &stdout, &stderr); code != exitError {
+				t.Errorf("exit = %d; want %d", code, exitError)
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Errorf("stderr = %q; want %q", stderr.String(), tc.want)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("validation failure wrote stdout: %q", stdout.String())
+			}
+		})
+	}
+}
+
+func TestOmittedInputFlagsAndHelpKeepDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"scan", ""}, "parse target: empty target"},
+		{[]string{"sweep", ""}, "sweep: empty host"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := Run(tc.args, &stdout, &stderr); code != exitError || !strings.Contains(stderr.String(), tc.want) {
+			t.Errorf("Run(%q) = %d, stderr %q; want error %q", tc.args, code, stderr.String(), tc.want)
+		}
+	}
+	for _, args := range [][]string{{"scan", "--file=", "--help"}, {"sweep", "--ports=", "--full", "--help"}} {
+		var stdout, stderr bytes.Buffer
+		if code := Run(args, &stdout, &stderr); code != exitOK || stderr.Len() != 0 || !strings.Contains(stdout.String(), "Usage:") {
+			t.Errorf("Run(%q) = %d, stdout %q, stderr %q; want help", args, code, stdout.String(), stderr.String())
+		}
 	}
 }
