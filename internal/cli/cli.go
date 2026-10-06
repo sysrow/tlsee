@@ -108,7 +108,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		allIPs    = fs.Bool("all-ips", false, "connect to every resolved A/AAAA address and compare certificates")
 		table     = fs.Bool("table", false, "always print the summary table, even for a single target")
 		quiet     = fs.Bool("quiet", false, "print only problems; print nothing when everything is healthy")
-		file      = fs.String("file", "", "read targets from a file (one per line; # comments and blanks ignored)")
+		file      = fs.String("file", "", "read targets from a non-empty file path (one per line; # comments and blanks ignored)")
 	)
 	fs.StringVar(file, "f", "", "shorthand for --file")
 	fs.BoolVar(quiet, "q", false, "shorthand for --quiet")
@@ -128,6 +128,11 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		}
 		// A real flag-parse error was already printed to stderr by flag.
 		printScanUsage(stderr, fs)
+		return exitError
+	}
+
+	if *file == "" && flagProvided(fs, "file", "f") {
+		fmt.Fprintln(stderr, "tlsee scan: --file requires a non-empty path")
 		return exitError
 	}
 
@@ -363,6 +368,20 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	return targets, nil
 }
 
+// flagProvided distinguishes an omitted optional flag from an explicitly empty
+// value. Aliases can share a destination while retaining separate visited names.
+func flagProvided(fs *flag.FlagSet, names ...string) bool {
+	provided := false
+	fs.Visit(func(f *flag.Flag) {
+		for _, name := range names {
+			if f.Name == name {
+				provided = true
+			}
+		}
+	})
+	return provided
+}
+
 // readHostFile opens path and parses its target lines. It wraps the errors
 // so the caller reports a clear message; parsing itself is delegated to
 // parseHostList so it can be tested without disk.
@@ -407,7 +426,7 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	var (
-		ports     = fs.String("ports", "", "ports to scan: comma list and/or ranges, e.g. 443,8443,9000-9100 (default: curated list)")
+		ports     = fs.String("ports", "", "ports to scan: non-empty comma list and/or ranges, e.g. 443,8443,9000-9100 (default: curated list)")
 		full      = fs.Bool("full", false, "scan all ports 1-65535 (slow)")
 		timeout   = fs.Duration("timeout", 3*time.Second, "per-port probe timeout")
 		asJSON    = fs.Bool("json", false, "emit JSON instead of text")
@@ -432,7 +451,8 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	}
 	host := hosts[0]
 
-	if *ports != "" && *full {
+	portsProvided := flagProvided(fs, "ports")
+	if portsProvided && *full {
 		fmt.Fprintln(stderr, "tlsee sweep: --ports and --full are mutually exclusive")
 		return exitError
 	}
@@ -448,7 +468,7 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 	case *full:
 		opts.Ports = fullPortRange()
 		opts.Concurrency = 256
-	case *ports != "":
+	case portsProvided:
 		list, err := tlsscan.ParsePortSpec(*ports)
 		if err != nil {
 			fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
@@ -639,7 +659,7 @@ Scan flags:
   --no-check          skip SAN liveness checks (on by default)
   --table             always print the summary table, even for one target
   -q, --quiet         print only problems; print nothing when all healthy
-  -f, --file PATH     read targets from a file (one per line; # comments ignored)
+  -f, --file PATH     read targets from a non-empty file path (# comments ignored)
   --insecure          always exit 0 even when the certificate has problems
 
 With more than one target, or with --table, tlsee scans every target
@@ -655,7 +675,7 @@ emits a single JSON object. Scripts that parse single-host JSON should account
 for this shape difference.
 
 Sweep flags:
-  --ports SPEC        comma list and/or ranges, e.g. 443,8443,9000-9100
+  --ports SPEC        non-empty comma list/ranges, e.g. 443,8443,9000-9100
   --full              scan all ports 1-65535 (slow)
   --timeout 3s        per-port probe timeout (default 3s)
   --json              emit JSON instead of text

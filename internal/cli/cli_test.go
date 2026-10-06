@@ -467,3 +467,58 @@ func TestDiagnosticOutputFailurePreservesExit(t *testing.T) {
 		})
 	}
 }
+
+func TestExplicitEmptyInputFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"file value", []string{"scan", "", "--file", ""}, "--file requires a non-empty path"},
+		{"file inline", []string{"scan", "", "--file="}, "--file requires a non-empty path"},
+		{"file alias", []string{"scan", "", "-f", ""}, "--file requires a non-empty path"},
+		{"file alias inline", []string{"scan", "", "-f="}, "--file requires a non-empty path"},
+		{"file without positional", []string{"scan", "--file="}, "--file requires a non-empty path"},
+		{"file overwritten", []string{"scan", "", "--file", "hosts.txt", "-f="}, "--file requires a non-empty path"},
+		{"ports value", []string{"sweep", "", "--ports", ""}, "parse ports: empty spec"},
+		{"ports inline", []string{"sweep", "", "--ports="}, "parse ports: empty spec"},
+		{"ports overwritten", []string{"sweep", "", "--ports", "443", "--ports="}, "parse ports: empty spec"},
+		{"empty ports conflict with full", []string{"sweep", "", "--ports=", "--full"}, "--ports and --full are mutually exclusive"},
+		{"empty ports with false full", []string{"sweep", "", "--ports=", "--full=false"}, "parse ports: empty spec"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// An empty target guarantees even the unfixed path cannot dial.
+			var stdout, stderr bytes.Buffer
+			if code := Run(tc.args, &stdout, &stderr); code != exitError {
+				t.Errorf("exit = %d; want %d", code, exitError)
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Errorf("stderr = %q; want %q", stderr.String(), tc.want)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("validation failure wrote stdout: %q", stdout.String())
+			}
+		})
+	}
+}
+
+func TestOmittedInputFlagsAndHelpKeepDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"scan", ""}, "parse target: empty target"},
+		{[]string{"sweep", ""}, "sweep: empty host"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := Run(tc.args, &stdout, &stderr); code != exitError || !strings.Contains(stderr.String(), tc.want) {
+			t.Errorf("Run(%q) = %d, stderr %q; want error %q", tc.args, code, stderr.String(), tc.want)
+		}
+	}
+	for _, args := range [][]string{{"scan", "--file=", "--help"}, {"sweep", "--ports=", "--full", "--help"}} {
+		var stdout, stderr bytes.Buffer
+		if code := Run(args, &stdout, &stderr); code != exitOK || stderr.Len() != 0 || !strings.Contains(stdout.String(), "Usage:") {
+			t.Errorf("Run(%q) = %d, stdout %q, stderr %q; want help", args, code, stdout.String(), stderr.String())
+		}
+	}
+}
