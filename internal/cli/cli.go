@@ -597,6 +597,7 @@ func printScanUsage(w io.Writer, fs *flag.FlagSet) error {
 	fmt.Fprintln(&text)
 	fmt.Fprintln(&text, "One or more targets, and/or -f/--file with one target per line.")
 	fmt.Fprintln(&text, "Connection or output failures exit 1, even with --insecure.")
+	fmt.Fprintln(&text, "SAN checks skipped by the limit or cancellation are reported separately.")
 	fmt.Fprintln(&text)
 	fmt.Fprintln(&text, "Flags:")
 	previousOutput := fs.Output()
@@ -687,7 +688,8 @@ longer resolves, or whose host is unreachable on the port). A name that
 resolves away from the scanned host is confirmed with one further handshake
 and reported as "elsewhere" when another certificate is served there. Dead and
 moved SANs are shown but do not change the exit code, which reflects the
-certificate's own validity. Use --no-check to skip this.
+certificate's own validity. Names skipped by the check limit or cancellation
+are reported as not probed. Use --no-check to skip these checks.
 
 Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon

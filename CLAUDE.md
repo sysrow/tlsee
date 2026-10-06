@@ -111,8 +111,8 @@ main.go   ->   internal/cli        ->   tlsscan             ->   internal/report
   `1` runtime/connection error, `2` certificate problem or no-args usage.
   In batch mode the worst per-host code wins, and `exitCertProb` outranks
   `exitError`. `--insecure` suppresses only certificate problems, never
-  connection failures. `Report.Healthy()` is the single source of truth shared
-  by the exit code, the `--quiet` row filter, and the status headline; do not
+  connection or output failures. `Report.Healthy()` is the single source of
+  truth shared by the exit code, the `--quiet` row filter, and the status headline; do not
   fork that logic. `sweep` never returns `2`: a complete run exits `0` with
   the findings in the table, and `1` on a usage or runtime error or when the
   sweep was interrupted before every port was probed
@@ -154,9 +154,9 @@ main.go   ->   internal/cli        ->   tlsscan             ->   internal/report
   it cannot forge a tabwriter column. JSON paths are deliberately left alone
   (`encoding/json` already escapes control characters).
 - **The batch table is laid out monochrome first, then colorized.** tabwriter
-  measures bytes, so coloring before layout would count invisible escape bytes
-  and misalign columns. `colorizeStatusCell` recolors the already-padded status
-  word in place.
+  measures code points, so coloring before layout would count invisible escapes
+  and misalign columns. `colorizeStatusCell` uses the header column position
+  to recolor the already-padded status in place; a hostname can itself be a status word.
 - **`--quiet` routes even a single target through the batch path**, so
   `scan host --quiet --json` emits a JSON *array* while `scan host --json` emits
   a single object. This shape difference is documented in `writeUsage`; keep it
@@ -170,4 +170,5 @@ main.go   ->   internal/cli        ->   tlsscan             ->   internal/report
 - Flag parsing supports interspersed positionals and a top-level `--`
   terminator via `parseInterspersed` (stdlib `flag` alone can't do this);
   both subcommands share it. Explicitly requested help goes to **stdout** and
-  exits `0`; usage shown because of an error goes to stderr.
+  exits `0` when written successfully (`1` on output failure); usage shown
+  because of an error goes to stderr.
