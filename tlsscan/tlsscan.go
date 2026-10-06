@@ -913,7 +913,7 @@ func certInfo(c *x509.Certificate, now time.Time) CertInfo {
 		SerialNumber:       c.SerialNumber.String(),
 		NotBefore:          c.NotBefore,
 		NotAfter:           c.NotAfter,
-		DaysRemaining:      int(c.NotAfter.Sub(now).Hours() / 24),
+		DaysRemaining:      wholeDaysRemaining(c.NotAfter, now),
 		Expired:            now.After(c.NotAfter),
 		NotYetValid:        now.Before(c.NotBefore),
 		DNSNames:           c.DNSNames,
@@ -923,6 +923,21 @@ func certInfo(c *x509.Certificate, now time.Time) CertInfo {
 		PublicKeyAlgorithm: c.PublicKeyAlgorithm.String(),
 		FingerprintSHA256:  formatFingerprint(sum[:]),
 	}
+}
+
+// wholeDaysRemaining counts full 24-hour periods, truncating toward zero.
+// Certificate dates can exceed time.Duration's roughly 292-year range, so
+// time.Time.Sub would clamp the result. Unix seconds cover the certificate
+// date range; the nanosecond adjustment preserves partial-day boundaries.
+func wholeDaysRemaining(expires, now time.Time) int {
+	seconds := expires.Unix() - now.Unix()
+	nanos := expires.Nanosecond() - now.Nanosecond()
+	if seconds > 0 && nanos < 0 {
+		seconds--
+	} else if seconds < 0 && nanos > 0 {
+		seconds++
+	}
+	return int(seconds / (24 * 60 * 60))
 }
 
 // keyBits returns the size of a public key in bits: the modulus length for RSA,
